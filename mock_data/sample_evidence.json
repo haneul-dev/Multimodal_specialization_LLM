@@ -1,0 +1,30 @@
+{
+  "query": "이 논문에서 제안하는 근거 처리 구조의 핵심 목적은 무엇인가?",
+  "hard_signal": true,
+  "evidences": [
+    {
+      "source_id": "doc_001",
+      "modality": "text",
+      "content": "본 연구는 멀티모달 RAG 환경에서 검색된 이종 데이터를 LLM이 효과적으로 이해하고 활용할 수 있도록 하는 계층형 근거 처리 구조를 제안한다.",
+      "relevance": 0.95
+    },
+    {
+      "source_id": "doc_002",
+      "modality": "text",
+      "content": "제안 구조는 검색된 정보를 무조건 많이 전달하는 방식이 아니라, 근거의 관련도와 모달리티 특성을 고려하여 선별·압축·정렬·통합한 뒤 LLM에 전달한다.",
+      "relevance": 0.9
+    },
+    {
+      "source_id": "doc_003",
+      "modality": "text",
+      "content": "본 연구는 멀티모달 RAG 환경에서 검색된 이종 데이터를 LLM이 효과적으로 이해하고 활용할 수 있도록 하는 계층형 근거 처리 구조를 제안한다.",
+      "relevance": 0.4
+    },
+    {
+      "source_id": "img_001",
+      "modality": "image",
+      "content": "그림 1: 제안 시스템의 전체 흐름도 (아직 캡션 파이프라인 미연결)",
+      "relevance": 0.6
+    }
+  ]
+}

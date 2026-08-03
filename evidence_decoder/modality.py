@@ -1,0 +1,338 @@
+"""1층 - 모달리티별 근거 디코더.
+
+각 디코더는 자기 모달리티의 원본만 본다. 하지만 출력은 전부
+EvidenceCard 리스트로 동일하다. 통합 계층이 모달리티를 몰라도
+동작하게 만드는 것이 이 계약의 핵심이다.
+
+디코더는 evidence 만 보지 않는다. 질문 이해 디코더가 준 focus_features,
+required_operations, constraints 를 함께 받아 "질문에 필요한 것만" 추출한다.
+"""
+
+from __future__ import annotations
+
+import time
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Mapping, Optional, Sequence
+
+from .assets import AssetLoader
+from .clients import LLMError, MediaAsset, StructuredLLMClient, VisionStructuredClient
+from .schemas import (
+    DecoderTask,
+    EvidenceCard,
+    EvidenceItem,
+    Modality,
+    ModalityEvidenceResult,
+    ModalityTask,
+)
+
+# ============================================================
+# 공통 출력 스키마
+# ============================================================
+
+CARD_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "cards": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "source_evidence_id": {"type": "string"},
+                    "claim": {"type": "string"},
+                    "detail": {"type": "string"},
+                    "supports": {"type": "array", "items": {"type": "string"}},
+                    "relevance": {"type": "number"},
+                    "confidence": {"type": "number"},
+                },
+                "required": [
+                    "source_evidence_id",
+                    "claim",
+                    "detail",
+                    "supports",
+                    "relevance",
+                    "confidence",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "modality_summary": {"type": "string"},
+        "is_sufficient": {"type": "boolean"},
+        "insufficient_reason": {"type": "string"},
+    },
+    "required": ["cards", "modality_summary", "is_sufficient", "insufficient_reason"],
+    "additionalProperties": False,
+}
+
+
+SYSTEM_PROMPT = """너는 멀티모달 RAG 시스템의 {modality} 근거 해석 디코더다.
+
+역할: 검색된 {modality} 근거를 읽고, 질문에 답하는 데 실제로 쓰일 근거 카드만 뽑는다.
+너는 최종 답변을 작성하지 않는다. 답변은 뒤쪽 디코더가 한다.
+
+규칙
+1. 근거 1건당 카드는 최대 {max_cards}개다. 질문과 무관한 근거는 카드를 만들지 마라.
+2. claim 은 이 근거가 말하는 핵심을 담은 한 문장이다. 뒤 단계에서 중복/충돌 판정의 기준이 되므로 구체적으로 써라.
+3. detail 은 답변에 실제 인용될 서술이다. 근거에 실제로 있는 내용만 써라.
+4. supports 에는 이 카드가 기여하는 required_operations 항목을 적어라. 해당 없으면 빈 배열.
+5. relevance 는 질문 초점 대비 관련도, confidence 는 근거 자체의 명확성이다. 둘 다 0.0~1.0.
+6. 근거에 없는 내용을 추론으로 채우지 마라. 부족하면 is_sufficient=false 로 신고하라.
+7. 모든 문자열은 한국어로 쓴다."""
+
+
+def _build_user_prompt(task: ModalityTask, context: DecoderTask, evidence_block: str) -> str:
+    lines = [
+        f"[원본 질문]\n{context.original_query}",
+        f"[정규화 질문]\n{task.query or context.normalized_query}",
+    ]
+    if context.input_context:
+        lines.append(f"[입력 모달리티 상황]\n{context.input_context}")
+    if task.focus_features:
+        lines.append(f"[이 모달리티에서 볼 초점]\n{', '.join(task.focus_features)}")
+    if task.required_operations:
+        lines.append(f"[필요한 작업]\n{', '.join(task.required_operations)}")
+    if context.identified_entities:
+        lines.append(f"[식별된 대상]\n{', '.join(context.identified_entities)}")
+    if task.constraints:
+        lines.append(f"[제약]\n{', '.join(task.constraints)}")
+    lines.append(f"[검색된 {task.modality.value} 근거 {len(task.evidence)}건]\n{evidence_block}")
+    lines.append(
+        "위 근거를 분석해 근거 카드를 만들어라. "
+        "source_evidence_id 는 반드시 위에 제시된 evidence_id 중 하나를 그대로 써라."
+    )
+    return "\n\n".join(lines)
+
+
+class ModalityEvidenceDecoder(ABC):
+    """모달리티별 디코더 공통 인터페이스."""
+
+    modality: Modality
+    max_cards_per_evidence: int = 2
+
+    @abstractmethod
+    def decode(self, task: ModalityTask, context: DecoderTask) -> ModalityEvidenceResult:
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+
+    def _empty(self, reason: str, started: float) -> ModalityEvidenceResult:
+        return ModalityEvidenceResult(
+            modality=self.modality,
+            cards=[],
+            is_sufficient=False,
+            insufficient_reason=reason,
+            latency_ms=(time.perf_counter() - started) * 1000,
+        )
+
+    def _parse(
+        self,
+        raw: Mapping[str, Any],
+        task: ModalityTask,
+        started: float,
+        extra_metadata: Optional[Mapping[str, Any]] = None,
+    ) -> ModalityEvidenceResult:
+        score_by_id = {item.evidence_id: item.score for item in task.evidence}
+        valid_ids = set(score_by_id)
+
+        cards: List[EvidenceCard] = []
+        for index, entry in enumerate(raw.get("cards") or []):
+            if not isinstance(entry, Mapping):
+                continue
+            claim = str(entry.get("claim", "") or "").strip()
+            if not claim:
+                continue
+
+            source_id = str(entry.get("source_evidence_id", "") or "").strip()
+            if source_id not in valid_ids:
+                # 모델이 없는 근거를 지어낸 경우. 버리지 않고 표시만 해서
+                # 환각률을 실험에서 셀 수 있게 한다.
+                metadata: Dict[str, Any] = {"unmapped_source": source_id}
+                source_id = task.evidence[0].evidence_id if task.evidence else "unknown"
+            else:
+                metadata = {}
+            if extra_metadata:
+                metadata.update(extra_metadata)
+
+            cards.append(
+                EvidenceCard(
+                    card_id=f"{task.modality.value}_card_{index}",
+                    source_evidence_id=source_id,
+                    modality=task.modality,
+                    claim=claim,
+                    detail=str(entry.get("detail", "") or "").strip(),
+                    supports=[str(s) for s in (entry.get("supports") or []) if str(s).strip()],
+                    relevance=_clamp(entry.get("relevance")),
+                    confidence=_clamp(entry.get("confidence")),
+                    retrieval_score=score_by_id.get(source_id, 0.0),
+                    metadata=metadata,
+                )
+            )
+
+        return ModalityEvidenceResult(
+            modality=task.modality,
+            cards=cards,
+            modality_summary=str(raw.get("modality_summary", "") or "").strip(),
+            is_sufficient=bool(raw.get("is_sufficient", True)) and bool(cards),
+            insufficient_reason=str(raw.get("insufficient_reason", "") or "").strip(),
+            latency_ms=(time.perf_counter() - started) * 1000,
+        )
+
+
+# ============================================================
+# 텍스트
+# ============================================================
+
+
+class TextEvidenceDecoder(ModalityEvidenceDecoder):
+    modality = Modality.TEXT
+
+    def __init__(
+        self,
+        client: StructuredLLMClient,
+        max_cards_per_evidence: int = 2,
+        max_chars_per_evidence: int = 2000,
+        modality: Modality = Modality.TEXT,
+    ) -> None:
+        self.client = client
+        self.max_cards_per_evidence = max_cards_per_evidence
+        self.max_chars_per_evidence = max_chars_per_evidence
+        self.modality = modality
+
+    def decode(self, task: ModalityTask, context: DecoderTask) -> ModalityEvidenceResult:
+        started = time.perf_counter()
+        if not task.evidence:
+            return self._empty("검색된 근거가 없음", started)
+
+        block = "\n\n".join(self._render(item) for item in task.evidence)
+        system = SYSTEM_PROMPT.format(
+            modality=task.modality.value, max_cards=self.max_cards_per_evidence
+        )
+        try:
+            raw = self.client.generate_json(
+                system, _build_user_prompt(task, context, block), CARD_SCHEMA
+            )
+        except LLMError as error:
+            result = self._empty(f"디코더 호출 실패: {error}", started)
+            result.failed = True
+            result.error = str(error)
+            return result
+
+        return self._parse(raw, task, started)
+
+    def _render(self, item: EvidenceItem) -> str:
+        body = item.content if isinstance(item.content, str) else repr(item.content)
+        if len(body) > self.max_chars_per_evidence:
+            body = body[: self.max_chars_per_evidence] + " ...(생략)"
+        header = f"- evidence_id: {item.evidence_id} (검색점수 {item.score:.4f})"
+        hint = item.caption_hint()
+        if hint:
+            header += f"\n  보조설명: {hint}"
+        return f"{header}\n  내용: {body}"
+
+
+# ============================================================
+# 이미지 / 영상
+# ============================================================
+
+
+class VisionEvidenceDecoder(ModalityEvidenceDecoder):
+    """이미지와 영상을 같은 코드로 처리한다.
+
+    차이는 AssetLoader 가 흡수한다 (영상 = 네이티브 입력 또는 프레임 샘플).
+    """
+
+    def __init__(
+        self,
+        client: VisionStructuredClient,
+        asset_loader: AssetLoader,
+        modality: Modality = Modality.IMAGE,
+        max_cards_per_evidence: int = 2,
+        max_assets: int = 8,
+    ) -> None:
+        self.client = client
+        self.asset_loader = asset_loader
+        self.modality = modality
+        self.max_cards_per_evidence = max_cards_per_evidence
+        self.max_assets = max_assets
+
+    def decode(self, task: ModalityTask, context: DecoderTask) -> ModalityEvidenceResult:
+        started = time.perf_counter()
+        if not task.evidence:
+            return self._empty("검색된 근거가 없음", started)
+
+        assets: List[MediaAsset] = []
+        lines: List[str] = []
+        degraded: List[str] = []
+
+        for item in task.evidence:
+            loaded = self.asset_loader.load(item)
+            line = f"- evidence_id: {item.evidence_id} (검색점수 {item.score:.4f})"
+            name = item.content if isinstance(item.content, str) else str(item.content)
+            line += f"\n  파일: {name}"
+
+            if loaded.ok and len(assets) < self.max_assets:
+                room = self.max_assets - len(assets)
+                chosen = loaded.assets[:room]
+                for asset in chosen:
+                    asset.label = f"{item.evidence_id} :: {asset.label}"
+                    if not asset.text_hint:
+                        asset.text_hint = item.caption_hint()
+                assets.extend(chosen)
+                line += f"\n  첨부: {len(chosen)}건 (아래 자료 참조)"
+            else:
+                reason = loaded.degraded_reason or "첨부 한도 초과"
+                degraded.append(f"{item.evidence_id}: {reason}")
+                hint = item.caption_hint()
+                line += f"\n  원본 미첨부 ({reason})"
+                if hint:
+                    line += f"\n  보조설명: {hint}"
+
+            if loaded.degraded_reason:
+                line += f"\n  비고: {loaded.degraded_reason}"
+            lines.append(line)
+
+        system = SYSTEM_PROMPT.format(
+            modality=task.modality.value, max_cards=self.max_cards_per_evidence
+        )
+        user = _build_user_prompt(task, context, "\n\n".join(lines))
+        if degraded:
+            user += (
+                "\n\n[주의] 다음 근거는 원본을 직접 확인하지 못했다. "
+                "보조설명만으로 판단하고 confidence 를 낮춰라.\n" + "\n".join(degraded)
+            )
+
+        try:
+            raw = self.client.generate_json(system, user, assets, CARD_SCHEMA)
+        except LLMError as error:
+            result = self._empty(f"디코더 호출 실패: {error}", started)
+            result.failed = True
+            result.error = str(error)
+            return result
+
+        extra = {"degraded": True} if degraded else None
+        result = self._parse(raw, task, started, extra_metadata=extra)
+        if degraded and not result.insufficient_reason:
+            result.insufficient_reason = "; ".join(degraded)
+        return result
+
+
+def build_modality_decoders(
+    text_client: StructuredLLMClient,
+    vision_client: VisionStructuredClient,
+    asset_loader: AssetLoader,
+    modalities: Sequence[Modality] = (Modality.TEXT, Modality.IMAGE, Modality.VIDEO),
+) -> Dict[Modality, ModalityEvidenceDecoder]:
+    """모달리티 -> 디코더 매핑. 새 모달리티는 여기 한 줄로 추가된다."""
+    decoders: Dict[Modality, ModalityEvidenceDecoder] = {}
+    for modality in modalities:
+        if modality in (Modality.IMAGE, Modality.VIDEO):
+            decoders[modality] = VisionEvidenceDecoder(vision_client, asset_loader, modality)
+        else:
+            decoders[modality] = TextEvidenceDecoder(text_client, modality=modality)
+    return decoders
+
+
+def _clamp(value: Any, low: float = 0.0, high: float = 1.0, default: float = 0.5) -> float:
+    try:
+        return max(low, min(high, float(value)))
+    except (TypeError, ValueError):
+        return default

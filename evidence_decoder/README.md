@@ -1,0 +1,133 @@
+# Evidence Decoder — 다층 디코더
+
+`adaptive_rag` 가 반환한 표준 패킷을 받아 최종 답변까지 만드는 3계층 디코더.
+
+```text
+Adaptive RAG 패킷
+    ↓ PacketAdapter
+[1층] 모달리티별 근거 디코더   text / image / video   (병렬 실행)
+    ↓ EvidenceCard[]
+[2층] 근거 통합 계층           중복제거 · 충돌확인 · 우선순위 · 분량예산
+    ↓ IntegratedEvidence
+[3층] 최종 답변 디코더         + 원본 질문 + answer_constraints
+```
+
+## 설계 핵심
+
+**모달리티와 무관한 단일 출력 규격.** 1층 디코더는 서로 다른 원본(텍스트/픽셀/영상)을 보지만
+출력은 전부 `EvidenceCard` 다. 덕분에 2층은 모달리티를 몰라도 동작하고,
+audio·table 이 추가돼도 2층 코드는 바뀌지 않는다.
+
+**전체 패킷을 직접 받는다.** `adaptive_rag.build_decoder_inputs()` 는
+`answer_constraints`, `complexity`, `uncertainty` 를 넘겨주지 않는다.
+최종 답변 디코더는 `answer_constraints` 없이 답변 형식 제약을 지킬 수 없으므로,
+`PacketAdapter` 가 `AdaptiveRAGOutput` 전체를 읽는다.
+구형 `build_decoder_inputs()` 결과도 그대로 받아들이지만 그 경로에서는 답변 제약이 복구되지 않는다.
+
+## 사용법
+
+```python
+from evidence_decoder import build_pipeline
+
+pipeline = build_pipeline(asset_root="./data")
+output = pipeline.run(rag_output)          # AdaptiveRAGOutput 또는 to_dict() 결과
+
+print(output.final_answer.answer)
+print(output.final_answer.citations)       # 근거로 쓴 card_id
+print(output.trace.total_ms)               # 단계별 지연
+```
+
+`adaptive_rag` 와 이어 붙일 때:
+
+```python
+from adaptive_rag.adaptive_multimodal_rag_V3 import AdaptiveMultimodalRAGPipeline
+from evidence_decoder import build_pipeline
+
+rag_output = rag_pipeline.run(question, modality_summaries)
+answer = build_pipeline(asset_root="./data").run(rag_output)
+```
+
+## 모델
+
+| 계층 | 모델 | 선정 근거 |
+|---|---|---|
+| 텍스트 근거 디코더 | Upstage `solar-pro3` | 실측 1.30s로 최속이면서 카드 개수 지시를 정확히 준수 (`solar-mini` 5.89s·지시 위반, `solar-pro2` 1.75s) |
+| 근거 통합 계층 | `solar-pro3` | 동일 |
+| 최종 답변 디코더 | `solar-pro3` | 한국어 답변 품질 |
+| 이미지·영상 디코더 | Gemini Flash | 영상을 프레임 분해 없이 그대로 처리 → 샘플링 파이프라인 불필요 |
+
+`solar-pro3` 는 `response_format: json_schema` strict 모드를 지원한다(실측 0.74s).
+스키마가 서버에서 강제되므로 **JSON 파싱 실패로 인한 재시도가 구조적으로 사라진다.**
+
+Upstage 3개 모델(`solar-mini`/`solar-pro2`/`solar-pro3`)은 모두 이미지 입력을 거부한다
+(`Image input is not allowed for this model`). 그래서 비전은 별도 백엔드가 필요하다.
+
+### 환경변수
+
+```bash
+UPSTAGE_API_KEY=up_...     # 필수 — 텍스트/통합/최종
+GOOGLE_API_KEY=...         # 선택 — 이미지/영상 (Gemini Flash)
+OPENAI_API_KEY=sk-...      # 선택 — Gemini 대신 사용
+```
+
+비전 키가 없으면 `CaptionFallbackVisionClient` 로 내려간다.
+`evidence.metadata` 의 caption/OCR/자막 텍스트만으로 판단하고, 카드에 `degraded=True` 를 남겨
+정상 경로와 실험에서 구분된다. `ResilientVisionClient` 가 런타임 401/429 도 같은 방식으로 흡수한다.
+
+## 속도 설계
+
+이 연구의 지표는 **RAG 도입에 따른 속도저하 억제**다. 세 가지 장치를 둔다.
+
+1. **모달 디코더 병렬 실행** — 1층 지연이 모달리티 수만큼 누적되지 않고 최댓값으로 수렴한다.
+   실측: text 3735ms + image 4853ms → 1층 4854ms (순차라면 8588ms).
+2. **저복잡도 바이패스** — `complexity.level == low` 이고 근거가 적으면 1층을 건너뛰고
+   검색 결과를 카드로 승격한다. LLM 호출 N회가 0회가 된다.
+   원본 해석이 필수인 image/video/audio 는 바이패스 대상에서 제외된다.
+3. **통합 계층 2단 구조** — 완전/근사 중복 제거, 우선순위 정렬, 분량 예산 절단은
+   LLM 없이 규칙으로 끝낸다. 모달리티가 2개 이상이거나 카드가 많을 때만 LLM 을 호출한다.
+
+## 실행
+
+```bash
+# 네트워크 없이 구조 검증
+python -m evidence_decoder.test_offline
+
+# 실제 LLM 1회 실행
+python evidence_decoder/examples/run_live.py
+python evidence_decoder/examples/run_live.py --packet rag_output.json --asset-root ./data
+
+# 지연/품질 비교 실험
+python -m evidence_decoder.bench --repeat 3
+```
+
+`bench` 비교군:
+
+| 구성 | 1층 | 2층 | 용도 |
+|---|---|---|---|
+| `raw` | 없음 | 없음 | 베이스라인 — 검색 결과 직접 투입 |
+| `no-integ` | 있음 | 없음 | 통합 계층 기여도 분리 |
+| `bypass` | 조건부 | 있음 | 바이패스 효과 |
+| `full` | 있음 | 있음 | 제안 구조 |
+
+## 구성
+
+| 파일 | 역할 |
+|---|---|
+| `schemas.py` | `EvidenceCard` 등 공통 스키마. 계층 간 계약이 전부 여기 있다 |
+| `packet.py` | Adaptive RAG 패킷 → `DecoderTask` 어댑터 |
+| `clients.py` | Solar / Gemini / OpenAI 클라이언트, 폴백 래퍼 (외부 SDK 의존 없음) |
+| `assets.py` | 파일명 → 실제 이미지·영상 해석, 영상 프레임 샘플링 |
+| `modality.py` | 1층 디코더 (텍스트 / 비전) |
+| `integration.py` | 2층 근거 통합 계층 |
+| `final_decoder.py` | 3층 최종 답변 디코더 |
+| `pipeline.py` | 병렬 실행·바이패스·계측 |
+| `bench.py` | 실험 하네스 |
+
+## adaptive_rag 담당자에게 요청할 사항
+
+1. `build_decoder_inputs()` 에 `answer_constraints` 와 `complexity.level` 추가.
+   현재는 `PacketAdapter` 가 전체 패킷을 직접 읽어 우회하고 있다.
+2. 이미지·영상 근거의 `metadata` 에 원본 경로(`path`)를 넣어줄 것.
+   현재 `content` 는 `poster_003.jpg` 같은 파일명뿐이라 `asset_root` 하위를 재귀 탐색해야 한다.
+3. 앞단 인코더가 만든 캡션·자막이 있다면 `metadata.caption` / `metadata.transcript` 로 전달.
+   비전 백엔드가 죽었을 때의 폴백 품질이 여기서 결정된다.

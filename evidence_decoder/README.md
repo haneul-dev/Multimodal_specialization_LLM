@@ -54,7 +54,7 @@ answer = build_pipeline(asset_root="./data").run(rag_output)
 | 텍스트 근거 디코더 | Upstage `solar-pro3` | 실측 1.30s로 최속이면서 카드 개수 지시를 정확히 준수 (`solar-mini` 5.89s·지시 위반, `solar-pro2` 1.75s) |
 | 근거 통합 계층 | `solar-pro3` | 동일 |
 | 최종 답변 디코더 | `solar-pro3` | 한국어 답변 품질 |
-| 이미지·영상 디코더 | Gemini Flash | 영상을 프레임 분해 없이 그대로 처리 → 샘플링 파이프라인 불필요 |
+| 이미지·영상 디코더 | Google `gemini-3.5-flash` | 영상을 프레임 분해 없이 그대로 처리. 실측 5.09s로 후보 중 최속(3.6-flash 6.37s, flash-latest 6.80s) |
 
 `solar-pro3` 는 `response_format: json_schema` strict 모드를 지원한다(실측 0.74s).
 스키마가 서버에서 강제되므로 **JSON 파싱 실패로 인한 재시도가 구조적으로 사라진다.**
@@ -69,6 +69,14 @@ UPSTAGE_API_KEY=up_...     # 필수 — 텍스트/통합/최종
 GOOGLE_API_KEY=...         # 선택 — 이미지/영상 (Gemini Flash)
 OPENAI_API_KEY=sk-...      # 선택 — Gemini 대신 사용
 ```
+
+`gemini-2.5-flash` 는 신규 사용자에게 더 이상 제공되지 않는다(404). `-latest` 별칭은
+모델이 바뀔 수 있어 실험 재현성을 위해 고정 이름을 쓴다.
+
+**검증 완료 (2026-08-04)** — 실제 이미지(도표 399KB)와 영상(넙치 466KB)을 넣어
+end-to-end 확인. 영상은 프레임 샘플링 없이 원본 그대로 전달했고, 캡션을 전혀 주지 않은
+상태에서 "갈색 바탕에 흰색 반점이 있는 납작한 물고기들이 모래 바닥에 움직임 없이
+멈춰 있다"고 정확히 판독했다. 지연은 이미지 6.2s / 영상 7.9s.
 
 비전 키가 없으면 `CaptionFallbackVisionClient` 로 내려간다.
 `evidence.metadata` 의 caption/OCR/자막 텍스트만으로 판단하고, 카드에 `degraded=True` 를 남겨

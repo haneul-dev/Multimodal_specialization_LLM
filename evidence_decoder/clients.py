@@ -29,7 +29,11 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 #   solar-mini 5.89s / solar-pro2 1.75s / solar-pro3 1.30s
 #   solar-mini 는 카드 개수 지시를 어겨 탈락.
 DEFAULT_SOLAR_MODEL = "solar-pro3"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+# 실측 기준 (2026-08, 399KB 이미지 + JSON 스키마 강제):
+#   gemini-3.5-flash 5.09s / gemini-3.6-flash 6.37s / gemini-flash-latest 6.80s
+#   gemini-2.5-flash 는 신규 사용자에게 더 이상 제공되지 않는다(404).
+#   -latest 별칭은 모델이 바뀔 수 있어 실험 재현성을 위해 고정 이름을 쓴다.
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 DEFAULT_OPENAI_VISION_MODEL = "gpt-4.1-mini"
 
 

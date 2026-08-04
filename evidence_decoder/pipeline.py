@@ -101,7 +101,7 @@ class MultiLayerDecoderPipeline:
         trace.cards_after_integration = len(integrated.cards)
 
         # ---- 3층 --------------------------------------------------
-        answer = self.final_decoder.decode(integrated, task)
+        answer = self.final_decoder.decode(integrated, task, results)
         trace.final_ms = answer.latency_ms
         trace.llm_calls += 1
         trace.total_ms = (time.perf_counter() - started) * 1000

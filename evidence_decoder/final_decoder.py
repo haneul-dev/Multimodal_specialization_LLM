@@ -10,10 +10,15 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .clients import LLMError, StructuredLLMClient
-from .schemas import DecoderTask, FinalAnswer, IntegratedEvidence
+from .schemas import (
+    DecoderTask,
+    FinalAnswer,
+    IntegratedEvidence,
+    ModalityEvidenceResult,
+)
 
 ANSWER_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -55,7 +60,12 @@ class FinalAnswerDecoder:
             else list(DEFAULT_ANSWER_CONSTRAINTS)
         )
 
-    def decode(self, integrated: IntegratedEvidence, context: DecoderTask) -> FinalAnswer:
+    def decode(
+        self,
+        integrated: IntegratedEvidence,
+        context: DecoderTask,
+        modality_results: Optional[Sequence[ModalityEvidenceResult]] = None,
+    ) -> FinalAnswer:
         started = time.perf_counter()
 
         if not integrated.cards:
@@ -70,7 +80,9 @@ class FinalAnswerDecoder:
 
         try:
             raw = self.client.generate_json(
-                FINAL_SYSTEM, self._user_prompt(integrated, context), ANSWER_SCHEMA
+                FINAL_SYSTEM,
+                self._user_prompt(integrated, context, modality_results or ()),
+                ANSWER_SCHEMA,
             )
         except LLMError as error:
             return FinalAnswer(
@@ -83,11 +95,18 @@ class FinalAnswerDecoder:
 
     # ------------------------------------------------------------------
 
-    def _user_prompt(self, integrated: IntegratedEvidence, context: DecoderTask) -> str:
+    def _user_prompt(
+        self,
+        integrated: IntegratedEvidence,
+        context: DecoderTask,
+        modality_results: Sequence[ModalityEvidenceResult] = (),
+    ) -> str:
         lines = [f"[원본 질문]\n{context.original_query}"]
 
         if context.input_context:
             lines.append(f"[사용자가 함께 준 입력]\n{context.input_context}")
+        if context.identified_entities:
+            lines.append(f"[질문에서 식별된 대상]\n{', '.join(context.identified_entities)}")
         if context.required_operations:
             lines.append(f"[수행할 작업]\n{', '.join(context.required_operations)}")
 
@@ -97,15 +116,46 @@ class FinalAnswerDecoder:
         if context.constraints:
             lines.append(f"[질문 제약]\n{', '.join(context.constraints)}")
 
+        # 모달리티별 디코더의 전체 소견. 개별 카드로 쪼개지면 사라지는
+        # "이 모달리티가 전반적으로 무엇을 말하는가" 를 최종 답변에 전달한다.
+        summaries = [
+            f"- {result.modality.value}: {result.modality_summary}"
+            for result in modality_results
+            if result.modality_summary
+        ]
+        if summaries:
+            lines.append("[모달리티별 종합 소견]\n" + "\n".join(summaries))
+
         card_lines = []
         for card in integrated.cards:
+            flags = []
+            if card.metadata.get("degraded"):
+                flags.append("원본 미확인")
+            if card.metadata.get("passthrough"):
+                flags.append("해석 생략")
+            suffix = f", {'/'.join(flags)}" if flags else ""
             card_lines.append(
                 f"- card_id: {card.card_id} (출처 {card.modality.value}/"
-                f"{card.source_evidence_id}, 확신도 {card.confidence:.2f})\n"
+                f"{card.source_evidence_id}, 확신도 {card.confidence:.2f}{suffix})\n"
                 f"  주장: {card.claim}\n"
                 f"  상세: {card.detail}"
             )
         lines.append(f"[통합 근거 {len(integrated.cards)}개]\n" + "\n".join(card_lines))
+
+        if any(card.metadata.get("degraded") for card in integrated.cards):
+            lines.append(
+                "[주의] '원본 미확인' 으로 표시된 근거는 이미지/영상 원본을 직접 보지 못하고 "
+                "설명 텍스트만으로 해석한 것이다. 그 근거에 의존한 서술은 단정하지 말고 "
+                "답변에서 한계를 밝혀라."
+            )
+
+        insufficient = [
+            f"- {result.modality.value}: {result.insufficient_reason}"
+            for result in modality_results
+            if not result.is_sufficient and result.insufficient_reason
+        ]
+        if insufficient:
+            lines.append("[모달리티별 근거 부족 신고]\n" + "\n".join(insufficient))
 
         if integrated.conflicts:
             conflict_lines = [

@@ -55,11 +55,33 @@ CARD_SCHEMA: Dict[str, Any] = {
                 "additionalProperties": False,
             },
         },
+        # 근거마다 대상·초점 일치 여부를 명시적으로 판정하게 한다.
+        # "무관한 근거는 카드를 만들지 마라"를 규칙으로 넣어 봤으나 실패했다
+        # (무관거부 0.00 유지, gold채택만 1.00 -> 0.93 하락).
+        # verify 질문에서 모델이 다른 대상의 근거를 "대조용 재료"로 해석하며
+        # 그 해석이 프롬프트 규칙을 이기기 때문이다. 판정을 카드 생성과 분리하고
+        # 강제 출력시킨 뒤, 배제는 코드가 결정한다.
+        "evidence_verdicts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "evidence_id": {"type": "string"},
+                    "same_subject": {"type": "boolean"},
+                    "on_focus": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["evidence_id", "same_subject", "on_focus", "reason"],
+                "additionalProperties": False,
+            },
+        },
         "modality_summary": {"type": "string"},
         "is_sufficient": {"type": "boolean"},
         "insufficient_reason": {"type": "string"},
     },
-    "required": ["cards", "modality_summary", "is_sufficient", "insufficient_reason"],
+    "required": [
+        "evidence_verdicts", "cards", "modality_summary", "is_sufficient", "insufficient_reason",
+    ],
     "additionalProperties": False,
 }
 
@@ -70,16 +92,16 @@ SYSTEM_PROMPT = """너는 멀티모달 RAG 시스템의 {modality} 근거 해석
 너는 최종 답변을 작성하지 않는다. 답변은 뒤쪽 디코더가 한다.
 
 규칙
-1. 근거 1건당 카드는 최대 {max_cards}개다. 질문과 무관한 근거는 카드를 만들지 마라.
-   대상이 다르면(질문은 감독 A 인데 근거는 감독 B) relevance 를 0.5 미만으로 낮춰라.
-
-# 주: 위 배제 규칙을 더 강하게 명시하는 판을 실측했으나 실패했다.
-#   기존 프롬프트: gold채택 1.00 / 무관거부 0.00
-#   강화 프롬프트: gold채택 0.93 / 무관거부 0.00  (n=9)
-# 무관 거부는 전혀 개선되지 않고 gold 채택률만 떨어졌다. 원인은 질문 프레이밍이다.
-# "근거의 신뢰도까지 따져서 설명해줘" 같은 verify 질문에서는 디코더가 다른 대상의
-# 근거를 "대조용 재료"로 판단하며, 이 해석이 프롬프트 규칙을 이긴다.
-# 그래서 배제는 프롬프트가 아니라 통합 계층의 min_relevance 로 처리한다.
+0. 먼저 evidence_verdicts 를 채운다. 주어진 근거 **전부**에 대해 두 가지를 판정한다.
+   빠뜨리지 마라. 이것은 카드 생성과 별개의 작업이며 먼저 수행한다.
+   - same_subject: 이 근거가 질문이 지목한 바로 그 대상을 다루는가.
+     질문이 감독 A 를 묻는데 근거가 감독 B 를 설명하면 false 다. 주제어가
+     겹쳐도, 대조에 쓸 만해 보여도, 대상이 다르면 false 다.
+     질문이 "따져 보라"고 요구하더라도 이 판정은 바뀌지 않는다.
+   - on_focus: 질문의 초점과 같은 측면을 다루는가.
+     연출 스타일을 묻는데 학력·제작비를 설명하면 false 다.
+     같은 대상의 다른 매체·시기를 다루어도 false 다.
+1. 근거 1건당 카드는 최대 {max_cards}개다.
 2. claim 은 이 근거가 말하는 핵심을 담은 한 문장이다. 뒤 단계에서 중복/충돌 판정의 기준이 되므로 구체적으로 써라.
 3. detail 은 답변에 실제 인용될 서술이다. 근거에 실제로 있는 내용만 써라.
 4. supports 에는 이 카드가 기여하는 required_operations 항목을 적어라. 해당 없으면 빈 배열.
@@ -125,6 +147,8 @@ class ModalityEvidenceDecoder(ABC):
     modality: Modality
     max_cards_per_evidence: int = 2
     concise: bool = True
+    # 근거별 대상·초점 판정을 코드가 강제할지. 끄면 판정만 받고 배제하지 않는다.
+    enforce_subject_filter: bool = True
 
     def _system_prompt(self, modality: Modality) -> str:
         return SYSTEM_PROMPT.format(
@@ -158,6 +182,22 @@ class ModalityEvidenceDecoder(ABC):
         score_by_id = {item.evidence_id: item.score for item in task.evidence}
         valid_ids = set(score_by_id)
 
+        # 근거별 판정에서 대상이 다르다고 나온 것은 코드가 배제한다.
+        # 모델에게 "만들지 마라"라고 지시하는 방식은 실패했으므로(질문
+        # 프레이밍이 규칙을 이긴다) 판정만 받고 배제는 여기서 결정한다.
+        rejected: Dict[str, str] = {}
+        if self.enforce_subject_filter:
+            for verdict in raw.get("evidence_verdicts") or []:
+                if not isinstance(verdict, Mapping):
+                    continue
+                eid = str(verdict.get("evidence_id", "") or "").strip()
+                if eid not in valid_ids:
+                    continue
+                if not verdict.get("same_subject", True):
+                    rejected[eid] = str(verdict.get("reason", "") or "대상 불일치")
+                elif not verdict.get("on_focus", True):
+                    rejected[eid] = str(verdict.get("reason", "") or "초점 불일치")
+
         cards: List[EvidenceCard] = []
         for index, entry in enumerate(raw.get("cards") or []):
             if not isinstance(entry, Mapping):
@@ -167,6 +207,8 @@ class ModalityEvidenceDecoder(ABC):
                 continue
 
             source_id = str(entry.get("source_evidence_id", "") or "").strip()
+            if source_id in rejected:
+                continue  # 대상·초점 불일치로 판정된 근거는 카드로 만들지 않는다
             if source_id not in valid_ids:
                 # 모델이 없는 근거를 지어낸 경우. 버리지 않고 표시만 해서
                 # 환각률을 실험에서 셀 수 있게 한다.
@@ -192,7 +234,7 @@ class ModalityEvidenceDecoder(ABC):
                 )
             )
 
-        return ModalityEvidenceResult(
+        result = ModalityEvidenceResult(
             modality=task.modality,
             cards=cards,
             modality_summary=str(raw.get("modality_summary", "") or "").strip(),
@@ -200,6 +242,12 @@ class ModalityEvidenceDecoder(ABC):
             insufficient_reason=str(raw.get("insufficient_reason", "") or "").strip(),
             latency_ms=(time.perf_counter() - started) * 1000,
         )
+        if rejected:
+            note = "대상·초점 불일치로 배제: " + ", ".join(rejected)
+            result.insufficient_reason = (
+                f"{result.insufficient_reason} / {note}" if result.insufficient_reason else note
+            )
+        return result
 
 
 # ============================================================
@@ -217,12 +265,14 @@ class TextEvidenceDecoder(ModalityEvidenceDecoder):
         max_chars_per_evidence: int = 2000,
         modality: Modality = Modality.TEXT,
         concise: bool = True,
+        enforce_subject_filter: bool = True,
     ) -> None:
         self.client = client
         self.max_cards_per_evidence = max_cards_per_evidence
         self.max_chars_per_evidence = max_chars_per_evidence
         self.modality = modality
         self.concise = concise
+        self.enforce_subject_filter = enforce_subject_filter
 
     def decode(self, task: ModalityTask, context: DecoderTask) -> ModalityEvidenceResult:
         started = time.perf_counter()
@@ -273,6 +323,7 @@ class VisionEvidenceDecoder(ModalityEvidenceDecoder):
         max_cards_per_evidence: int = 2,
         max_assets: int = 8,
         concise: bool = True,
+        enforce_subject_filter: bool = True,
     ) -> None:
         self.client = client
         self.asset_loader = asset_loader
@@ -280,6 +331,7 @@ class VisionEvidenceDecoder(ModalityEvidenceDecoder):
         self.max_cards_per_evidence = max_cards_per_evidence
         self.max_assets = max_assets
         self.concise = concise
+        self.enforce_subject_filter = enforce_subject_filter
 
     def decode(self, task: ModalityTask, context: DecoderTask) -> ModalityEvidenceResult:
         started = time.perf_counter()
@@ -346,17 +398,20 @@ def build_modality_decoders(
     asset_loader: AssetLoader,
     modalities: Sequence[Modality] = (Modality.TEXT, Modality.IMAGE, Modality.VIDEO),
     concise: bool = True,
+    enforce_subject_filter: bool = True,
 ) -> Dict[Modality, ModalityEvidenceDecoder]:
     """모달리티 -> 디코더 매핑. 새 모달리티는 여기 한 줄로 추가된다."""
     decoders: Dict[Modality, ModalityEvidenceDecoder] = {}
     for modality in modalities:
         if modality in (Modality.IMAGE, Modality.VIDEO):
             decoders[modality] = VisionEvidenceDecoder(
-                vision_client, asset_loader, modality, concise=concise
+                vision_client, asset_loader, modality, concise=concise,
+                enforce_subject_filter=enforce_subject_filter,
             )
         else:
             decoders[modality] = TextEvidenceDecoder(
-                text_client, modality=modality, concise=concise
+                text_client, modality=modality, concise=concise,
+                enforce_subject_filter=enforce_subject_filter,
             )
     return decoders
 

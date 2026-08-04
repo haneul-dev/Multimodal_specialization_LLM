@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -37,8 +38,14 @@ FINAL_SYSTEM = """너는 멀티모달 RAG 시스템의 최종 답변 디코더�
 통합된 근거 카드만을 사용해 사용자의 원본 질문에 답한다.
 
 규칙
-1. 근거 카드에 없는 사실을 만들어내지 마라. 근거가 부족하면 부족하다고 말하라.
-2. answer 는 사용자에게 그대로 보여줄 최종 답변이다. card_id 를 본문에 노출하지 마라.
+1. answer 는 사용자에게 그대로 보여줄 최종 답변이다. card_id 를 절대 쓰지 마라.
+   괄호 안에도, 문장 속에도 쓰지 마라. 출처는 citations 필드로만 표시한다.
+   금지: "긴 컷을 사용했다(text_card_0)."
+   금지: "text_card_1과 text_card_4는 서로 모순된다."
+   허용: "긴 컷을 사용했다."
+   허용: "편집 속도에 대해서는 상반된 분석이 있다."
+   근거끼리 대조할 때는 card_id 대신 내용으로 지칭하라.
+2. 근거 카드에 없는 사실을 만들어내지 마라. 근거가 부족하면 부족하다고 말하라.
 3. citations 에는 답변에 실제로 사용한 card_id 를 적어라.
 4. 근거 없이 쓸 수밖에 없었던 문장이 있으면 unsupported_claims 에 그대로 옮겨라. 없으면 빈 배열.
 5. 근거 간 충돌이 보고되면 한쪽을 숨기지 말고 답변에서 차이를 밝혀라.
@@ -182,7 +189,7 @@ class FinalAnswerDecoder:
             str(cid) for cid in (raw.get("citations") or []) if str(cid) in valid_ids
         ]
         return FinalAnswer(
-            answer=str(raw.get("answer", "") or "").strip(),
+            answer=_strip_card_ids(str(raw.get("answer", "") or "").strip()),
             citations=citations,
             unsupported_claims=[
                 str(claim) for claim in (raw.get("unsupported_claims") or []) if str(claim).strip()
@@ -190,6 +197,40 @@ class FinalAnswerDecoder:
             confidence=_clamp(raw.get("confidence")),
             latency_ms=(time.perf_counter() - started) * 1000,
         )
+
+
+_CARD_ID = r"(?:text|image|video|audio|table)_card_\d+"
+# "(text_card_0)", "[text_card_0, text_card_1]" 같은 괄호 인용
+_PAREN_CITE = re.compile(r"\s*[\(\[]\s*" + _CARD_ID + r"(?:\s*[,、]\s*" + _CARD_ID + r")*\s*[\)\]]")
+# "text_card_1과 text_card_4는" 처럼 문장 속에 박힌 경우.
+# \b 경계를 쓰면 안 된다 - 한글 조사가 단어 문자라 "text_card_1과" 에서
+# 경계가 성립하지 않아 매칭에 실패한다. 패턴 자체가 충분히 특정적이다.
+_BARE_CITE = re.compile(_CARD_ID)
+
+# 치환어 "한 근거"는 받침이 없으므로 뒤따르는 조사를 바꿔야 한다.
+_PARTICLE_MAP = {"과": "와", "은": "는", "이": "가", "을": "를", "으로": "로"}
+_PARTICLE = re.compile("한 근거(" + "|".join(sorted(_PARTICLE_MAP, key=len, reverse=True)) + ")")
+
+
+def _strip_card_ids(answer: str) -> str:
+    """답변 본문에서 내부 식별자를 제거한다.
+
+    프롬프트로 금지해도 지켜지지 않는다(실측 ID누출 0.33건/실행). 사용자에게
+    보여줄 문자열이므로 규칙으로 확실히 막는다. 출처는 citations 필드에 남는다.
+
+    괄호 인용은 통째로 지우고, 문장 속에 박힌 것은 "한 근거"로 바꿔
+    문법이 깨지지 않게 한다.
+    """
+    if not answer:
+        return answer
+    cleaned = _PAREN_CITE.sub("", answer)
+    cleaned = _BARE_CITE.sub("한 근거", cleaned)
+    # 치환 결과 뒤에 오는 조사를 받침 없는 "거"에 맞춘다.
+    # (text_card_1'과' -> 한 근거'와')
+    cleaned = _PARTICLE.sub(lambda m: "한 근거" + _PARTICLE_MAP[m.group(1)], cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([.,!?])", r"\1", cleaned)
+    return cleaned.strip()
 
 
 def _clamp(value: Any, default: float = 0.5) -> float:

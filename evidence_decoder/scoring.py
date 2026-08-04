@@ -30,12 +30,15 @@ datagen.py 가 근거마다 심어둔 역할 라벨(_role)을 기준으로 각 �
 from __future__ import annotations
 
 import json
+import re
 import statistics
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .clients import LLMError, StructuredLLMClient
 from .schemas import DecoderOutput, Modality
+
+_CARD_ID_RE = re.compile(r"\b(?:text|image|video|audio|table)_card_\d+\b")
 
 GOLD = "gold"
 IRRELEVANT = "irrelevant"
@@ -67,6 +70,7 @@ class QualityScore:
     contamination: Optional[int] = None
     conflict_disclosed: Optional[bool] = None
     unsupported_claims: int = 0
+    card_id_leak: int = 0
     # 메타
     degraded: bool = False
     judge_error: str = ""
@@ -191,6 +195,10 @@ def score_rules(output: DecoderOutput, packet: Mapping[str, Any]) -> QualityScor
     score.citation_coverage = _ratio(
         len(gold_kept_ids & set(answer.citations)), len(gold_kept_ids)
     )
+
+    # card_id 누출: 사용자에게 보여줄 답변 본문에 내부 식별자가 남았는가.
+    # 프롬프트에 금지 규칙이 있어도 지켜지지 않는 사례가 실측되었다.
+    score.card_id_leak = len(_CARD_ID_RE.findall(answer.answer))
 
     # 인용 정밀도: 답변이 실제로 기댄 근거 중 gold 비율.
     # citation_validity 는 "존재하는 카드인가"만 보므로 잡음 카드를 인용해도
@@ -323,6 +331,7 @@ METRIC_ORDER = [
     ("citation_precision", "인용정밀", True),
     ("key_point_coverage", "요지충족", True),
     ("contamination", "오염서술", False),
+    ("card_id_leak", "ID누출", False),
 ]
 
 

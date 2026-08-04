@@ -20,7 +20,7 @@ import statistics
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .clients import LLMError, build_default_clients
 from .final_decoder import FinalAnswerDecoder
@@ -29,6 +29,7 @@ from .modality import build_modality_decoders
 from .packet import PacketAdapter
 from .pipeline import MultiLayerDecoderPipeline, PipelineConfig
 from .schemas import DecoderOutput, Level, Modality
+from .scoring import QualityScore, print_scores, score_output
 
 ARMS = ("raw", "no-integ", "bypass", "full")
 
@@ -119,9 +120,14 @@ def run_bench(
     repeat: int = 1,
     asset_root: Optional[str] = None,
     group_by_meta: bool = False,
-) -> Dict[str, ArmResult]:
+    score: bool = False,
+) -> Tuple[Dict[str, ArmResult], Dict[str, List[QualityScore]]]:
     clients = build_default_clients()
     print(f"비전 백엔드: {clients['vision_backend']}")
+    # 심판은 생성 디코더와 같은 모델을 쓰되 별도 호출이다. 채점 기준의
+    # 대부분은 규칙이고, 심판은 답변 요지 충족 여부만 판정한다.
+    judge = clients["text"] if score else None
+    scores: Dict[str, List[QualityScore]] = {}
 
     # 워밍업. 첫 호출은 TCP/TLS 핸드셰이크와 모델 콜드스타트를 떠안으므로
     # 측정에 넣으면 첫 번째 구성만 불리해진다.
@@ -146,6 +152,10 @@ def run_bench(
                 try:
                     output = pipeline.run(packet)
                     result.record(output)
+                    if score:
+                        scores.setdefault(key, []).append(
+                            score_output(output, packet, judge, arm=arm)
+                        )
                     print(
                         f"  [{arm}] {name:22s} "
                         f"{output.trace.total_ms:7.0f}ms  "
@@ -156,7 +166,7 @@ def run_bench(
                 except Exception as error:  # noqa: BLE001
                     result.errors.append(repr(error))
                     print(f"  [{arm}] {name} 실패: {error}")
-    return results
+    return results, scores
 
 
 def print_table(results: Dict[str, ArmResult]) -> None:
@@ -215,13 +225,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--arms", nargs="*", default=list(ARMS), choices=list(ARMS))
     parser.add_argument("--group", action="store_true", help="_meta.group 별로 나눠 집계")
+    parser.add_argument("--score", action="store_true", help="품질 채점까지 수행")
     args = parser.parse_args(argv)
 
     packets = load_packets(args.packets)
     print(f"패킷 {len(packets)}개 x 반복 {args.repeat}회 x 구성 {len(args.arms)}종")
     started = time.perf_counter()
-    results = run_bench(packets, args.arms, args.repeat, args.asset_root, args.group)
+    results, scores = run_bench(
+        packets, args.arms, args.repeat, args.asset_root, args.group, args.score
+    )
     print_table(results)
+    if scores:
+        print_scores(scores)
     print(f"총 소요 {time.perf_counter() - started:.1f}s")
     return 0
 

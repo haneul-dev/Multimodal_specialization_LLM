@@ -56,6 +56,37 @@ GOLD_TEXTS = [
     "사운드 사용도 달라졌다. 초기작은 현장음과 침묵에 크게 의존했지만 최근작은 지속적인 배경 음악으로 정서를 유도한다. 음악 감독과의 협업 방식이 바뀐 것이 원인으로 지목된다.",
 ]
 
+# GOLD_TEXTS 와 같은 순서. 정답 답변이 담아야 할 요지다.
+# 답변 정확도 채점(scoring.py)의 기준이 된다.
+GOLD_KEY_POINTS = [
+    "초기작은 인물 중심 서사와 느린 호흡, 긴 컷을 사용했다",
+    "최근작은 편집 속도가 빨라지고 평균 숏 길이가 짧아졌다",
+    "색채가 저채도 청색에서 주황-청록 보색 대비로 바뀌었다",
+    "인물 배치가 대칭에서 비대칭으로 이동했다",
+    "사운드가 현장음·침묵 중심에서 지속적 배경 음악으로 바뀌었다",
+]
+
+# Hard negative. 주제가 아예 다른 잡음은 1층 디코더가 100% 걸러내서
+# 실험에 변별력이 없었다(무관거부율 모든 구간 1.00). 실제 검색기가 섞어오는
+# 잡음은 이런 모양이다 - 같은 주제어를 공유하면서 질문의 초점만 빗나간다.
+#   (a) 대상은 맞고 측면이 다름
+#   (b) 측면은 맞고 대상이 다름  <- 가장 위험. 답변에 다른 대상 정보가 섞인다
+#   (c) 대상·측면 모두 맞지만 매체·시기가 다름
+HARD_NEGATIVE_TEXTS = [
+    # (b) 다른 감독, 같은 측면
+    "감독 B의 최근작은 편집 속도를 오히려 늦추고 롱테이크 비중을 늘렸다. 평균 숏 길이가 이전 작품보다 길어졌으며 인물을 화면 중앙에 대칭으로 배치하는 구도가 두드러진다.",
+    # (a) 같은 감독, 무관한 측면
+    "감독 A는 대학에서 철학을 전공한 뒤 광고 대행사에서 5년간 근무했다. 영화계 입문은 단편 영화 공모전 수상을 계기로 이루어졌다.",
+    # (c) 같은 감독·측면이지만 매체가 다름
+    "감독 A가 연출한 자동차 광고는 3초 단위의 빠른 컷과 강한 보색 대비를 사용한다. 광고 특성상 짧은 시간에 시선을 붙잡아야 하기 때문이다.",
+    # (b) 다른 감독, 같은 측면
+    "감독 C의 색채 설계는 데뷔작부터 일관되게 주황과 청록의 보색 대비를 유지해 왔다. 촬영감독을 교체한 적이 없다는 점이 원인으로 지목된다.",
+    # (a) 같은 감독, 무관한 측면
+    "감독 A의 최근작은 제작비가 이전작의 세 배로 늘었고 해외 로케이션 촬영 비중이 커졌다. 배급사도 대형사로 바뀌었다.",
+    # (c) 같은 감독·측면이지만 시기가 다름
+    "감독 A가 학생 시절 만든 습작 단편들은 편집 실험이 두드러진다. 다만 본인은 이 작품들을 필모그래피에서 제외하고 있다.",
+]
+
 IRRELEVANT_TEXTS = [
     "1990년대 한국 영화 산업의 배급 구조는 대기업 자본의 유입으로 크게 재편되었다. 멀티플렉스 확산은 상영 편수와 스크린 점유 방식을 근본적으로 바꾸었으며, 이는 독립 영화의 상영 기회 축소로 이어졌다는 지적이 있다.",
     "영화제 수상 이력은 감독의 이후 제작비 규모와 상관관계를 보인다. 다만 이 상관이 인과인지에 대해서는 표본 편향 문제가 제기되어 왔으며, 수상 이전부터 투자 규모가 컸다는 반론도 존재한다.",
@@ -140,6 +171,9 @@ class PacketSpec:
     modalities: Sequence[Modality]
     gold_per_modality: int = 2
     irrelevant_per_modality: int = 0
+    # True 면 주제를 공유하는 hard negative 를 쓴다. 쉬운 잡음은 1층이
+    # 전부 걸러내 실험 변별력이 사라진다.
+    hard_negatives: bool = True
     duplicates: int = 0
     contradictions: int = 0
     reinforcing: int = 0
@@ -154,8 +188,9 @@ def _text_evidence(spec: PacketSpec) -> List[Dict[str, Any]]:
         entries.append((EvidenceRole.DUPLICATE, DUPLICATE_TEXTS[i % len(DUPLICATE_TEXTS)]))
     for i in range(spec.contradictions):
         entries.append((EvidenceRole.CONTRADICTORY, CONTRADICTORY_TEXTS[i % len(CONTRADICTORY_TEXTS)]))
+    pool = HARD_NEGATIVE_TEXTS if spec.hard_negatives else IRRELEVANT_TEXTS
     for i in range(spec.irrelevant_per_modality):
-        entries.append((EvidenceRole.IRRELEVANT, IRRELEVANT_TEXTS[i % len(IRRELEVANT_TEXTS)]))
+        entries.append((EvidenceRole.IRRELEVANT, pool[i % len(pool)]))
 
     evidence = []
     for index, (role, content) in enumerate(entries):
@@ -290,6 +325,18 @@ def build_packet(spec: PacketSpec) -> Dict[str, Any]:
             ),
             "duplicate_total": spec.duplicates,
             "contradiction_total": spec.contradictions,
+            # 채점 기준 (scoring.py 가 읽는다)
+            "key_points": GOLD_KEY_POINTS[: spec.gold_per_modality]
+            if Modality.TEXT in spec.modalities
+            else [],
+            "irrelevant_topics": [
+                t.split(".")[0][:60]
+                for t in (HARD_NEGATIVE_TEXTS if spec.hard_negatives else IRRELEVANT_TEXTS)[
+                    : spec.irrelevant_per_modality
+                ]
+            ],
+            "hard_negatives": spec.hard_negatives,
+            "has_conflict": spec.contradictions > 0,
         },
     }
 
@@ -326,6 +373,10 @@ def sweep_dilution() -> List[Dict[str, Any]]:
     """근거 희석 실험용. 무관 근거 비율을 0 -> 높음으로 올린다.
 
     통합 계층이 있는 구성과 없는 구성의 답변 품질 격차가 벌어져야 한다.
+
+    텍스트 전용이다. 희석은 근거 개수와 잡음 비율의 문제라 모달리티와 무관하고,
+    비전 백엔드 할당량에 실험이 묶이지 않게 하기 위함이다.
+    멀티모달 희석은 sweep_dilution_multimodal 로 따로 잰다.
     """
     specs: List[PacketSpec] = []
     for irrelevant in (0, 2, 4, 6):
@@ -334,12 +385,28 @@ def sweep_dilution() -> List[Dict[str, Any]]:
             PacketSpec(
                 group=f"dilution/{int(ratio * 100)}%",
                 level=Level.MEDIUM,
-                modalities=[Modality.TEXT, Modality.IMAGE],
+                modalities=[Modality.TEXT],
                 gold_per_modality=3,
                 irrelevant_per_modality=irrelevant,
                 packet_id=f"dil_{irrelevant}",
             )
         )
+    return [build_packet(spec) for spec in specs]
+
+
+def sweep_dilution_multimodal() -> List[Dict[str, Any]]:
+    """희석 실험의 멀티모달 판. 비전 백엔드가 살아 있을 때 쓴다."""
+    specs = [
+        PacketSpec(
+            group=f"dilution-mm/{int(irrelevant / (3 + irrelevant) * 100)}%",
+            level=Level.MEDIUM,
+            modalities=[Modality.TEXT, Modality.IMAGE],
+            gold_per_modality=3,
+            irrelevant_per_modality=irrelevant,
+            packet_id=f"dilmm_{irrelevant}",
+        )
+        for irrelevant in (0, 2, 4, 6)
+    ]
     return [build_packet(spec) for spec in specs]
 
 
@@ -392,9 +459,29 @@ def sweep_integration() -> List[Dict[str, Any]]:
     ]
 
 
+def sweep_dilution_easy() -> List[Dict[str, Any]]:
+    """주제가 아예 다른 쉬운 잡음. hard negative 와의 대조군."""
+    return [
+        build_packet(
+            PacketSpec(
+                group=f"dilution-easy/{int(n / (3 + n) * 100)}%",
+                level=Level.MEDIUM,
+                modalities=[Modality.TEXT],
+                gold_per_modality=3,
+                irrelevant_per_modality=n,
+                hard_negatives=False,
+                packet_id=f"dileasy_{n}",
+            )
+        )
+        for n in (0, 2, 4, 6)
+    ]
+
+
 SWEEPS = {
     "latency": sweep_latency,
+    "dilution-easy": sweep_dilution_easy,
     "dilution": sweep_dilution,
+    "dilution-mm": sweep_dilution_multimodal,
     "integration": sweep_integration,
 }
 

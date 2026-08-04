@@ -291,6 +291,86 @@ def test_integration_rules() -> bool:
     return bool(ok)
 
 
+def test_scoring() -> bool:
+    """채점기가 심어둔 라벨을 정확히 집계하는지 본다.
+
+    LLM 없이 규칙 지표만 검증한다. 채점 기준 자체가 틀리면 이후 모든
+    품질 실험이 무의미해지므로, 정답을 아는 상황을 만들어 대조한다.
+    """
+    print("[6] 품질 채점기 - 규칙 지표")
+    from .datagen import PacketSpec, build_packet
+    from .scoring import score_rules
+    from .schemas import (
+        ConflictNote,
+        DecoderOutput,
+        DecoderTrace,
+        EvidenceCard,
+        FinalAnswer,
+        IntegratedEvidence,
+        ModalityEvidenceResult,
+    )
+
+    packet = build_packet(
+        PacketSpec(
+            group="test",
+            level=Level.MEDIUM,
+            modalities=[Modality.TEXT],
+            gold_per_modality=2,      # text_0, text_1
+            duplicates=1,             # text_2
+            contradictions=1,         # text_3
+            irrelevant_per_modality=2,  # text_4, text_5
+            packet_id="score_test",
+        )
+    )
+
+    def card(cid, source, claim="c"):
+        return EvidenceCard(
+            card_id=cid, source_evidence_id=source, modality=Modality.TEXT,
+            claim=claim, detail="d", relevance=0.8, confidence=0.8,
+        )
+
+    # 1층: gold 2건 모두 카드화, 중복·모순도 카드화, 무관 2건 중 1건만 잘못 카드화
+    made = [card("c_g0", "text_0"), card("c_g1", "text_1"),
+            card("c_dup", "text_2"), card("c_con", "text_3"),
+            card("c_irr", "text_4")]
+    # 2층: 중복은 제거, 모순은 충돌로 보고하고 유지, 무관 카드는 제거
+    kept = [made[0], made[1], made[3]]
+
+    output = DecoderOutput(
+        original_query=packet["original_query"],
+        final_answer=FinalAnswer(answer="답변", citations=["c_g0"], confidence=0.8),
+        integrated=IntegratedEvidence(
+            cards=kept,
+            dropped_card_ids=["c_dup", "c_irr"],
+            duplicate_groups=[["c_g0", "c_dup"]],
+            conflicts=[ConflictNote(card_ids=["c_g1", "c_con"], description="모순")],
+        ),
+        modality_results=[ModalityEvidenceResult(modality=Modality.TEXT, cards=made)],
+        trace=DecoderTrace(),
+    )
+
+    s = score_rules(output, packet)
+    ok = True
+    ok &= _check(s.gold_recall == 1.0, f"gold 채택률 1.00 (실제 {s.gold_recall})")
+    ok &= _check(s.irrelevant_rejection == 0.5, f"무관 거부율 0.50 — 2건 중 1건 오채택 (실제 {s.irrelevant_rejection})")
+    ok &= _check(s.duplicate_removal == 1.0, f"중복 제거율 1.00 (실제 {s.duplicate_removal})")
+    ok &= _check(s.conflict_detection == 1.0, f"충돌 탐지율 1.00 (실제 {s.conflict_detection})")
+    ok &= _check(s.final_gold_precision == round(2 / 3, 4), f"근거 정밀도 0.67 — 최종 3장 중 gold 2장 (실제 {s.final_gold_precision})")
+    ok &= _check(s.citation_validity == 1.0, f"인용 유효율 1.00 (실제 {s.citation_validity})")
+    ok &= _check(s.citation_coverage == 0.5, f"인용 범위 0.50 — gold 2장 중 1장만 인용 (실제 {s.citation_coverage})")
+    ok &= _check(s.modality_loss == 0, f"모달 소실 0 (실제 {s.modality_loss})")
+    ok &= _check(s.source_hallucination == 0.0, f"출처 환각 0.00 (실제 {s.source_hallucination})")
+
+    # 분모가 0인 지표는 0.0 이 아니라 None 이어야 평균이 왜곡되지 않는다
+    plain = build_packet(
+        PacketSpec(group="t", level=Level.MEDIUM, modalities=[Modality.TEXT],
+                   gold_per_modality=1, packet_id="plain")
+    )
+    s2 = score_rules(output, plain)
+    ok &= _check(s2.duplicate_removal is None, "중복 근거가 없으면 중복제거율은 None (0.0 아님)")
+    return bool(ok)
+
+
 def main() -> int:
     print("=" * 60)
     print("다층 디코더 오프라인 테스트 (네트워크 없음)")
@@ -300,6 +380,7 @@ def main() -> int:
         test_pipeline(),
         test_bypass(),
         test_integration_rules(),
+        test_scoring(),
     ]
     print("=" * 60)
     if all(results):

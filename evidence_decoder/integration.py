@@ -79,8 +79,13 @@ INTEGRATION_SYSTEM = """너는 멀티모달 RAG 시스템의 근거 통합 계�
 최종 답변 디코더가 쓸 근거 집합으로 정리한다. 답변은 작성하지 않는다.
 
 할 일
-1. 중복: 같은 사실을 말하는 카드를 묶고 대표 1개만 남긴다. 모달리티가 다르면
-   서로를 보강하는 것이므로 함부로 묶지 마라. 같은 사실일 때만 묶는다.
+1. 중복: 같은 사실을 말하는 카드를 묶고 대표 1개만 남긴다.
+   판단 기준은 어휘가 아니라 의미다. 표현이 전혀 겹치지 않아도 같은 사실을
+   말하면 중복이다. 예를 들어 "느린 호흡과 긴 컷을 유지했다" 와 "컷을 자주
+   나누지 않고 인물을 오래 담아냈다" 는 단어가 거의 겹치지 않지만 같은 사실이다.
+   앞 단계의 어휘 기반 규칙은 이런 중복을 잡지 못하므로 여기서 반드시 잡아야 한다.
+   모든 카드 쌍을 하나씩 대조하고, 같은 사실을 말하는 묶음마다 대표 1개만 남겨라.
+   단 모달리티가 다르면 서로를 보강하는 것이므로 묶지 마라.
 2. 충돌: 서로 모순되는 카드를 찾아 무엇이 충돌인지, 어느 쪽을 우선할지 적는다.
    검색점수와 confidence 가 높은 쪽을 우선하되 판단 근거를 resolution 에 남겨라.
 3. 선별: 질문에 답하는 데 불필요한 카드는 dropped_card_ids 로 보낸다.
@@ -106,6 +111,7 @@ class EvidenceIntegrationLayer:
         char_budget: int = 4000,
         duplicate_threshold: float = 0.85,
         cross_modal_threshold: float = 0.35,
+        min_relevance: Optional[float] = None,
     ) -> None:
         self.client = client
         self.max_cards = max_cards
@@ -115,6 +121,12 @@ class EvidenceIntegrationLayer:
         # 모달리티를 가로지르는 주장이 이만큼 겹치면 LLM 통합을 부른다.
         # 낮출수록 LLM 호출이 늘고 중복/충돌을 더 잡는다.
         self.cross_modal_threshold = cross_modal_threshold
+        # 관련도 하한. 1층이 무관 근거를 relevance 로는 낮게 매기면서도
+        # 카드 생성 자체는 막지 못하는 경우가 있어(특히 verify 질문) 여기서 자른다.
+        # None 이면 끈다. 값은 데이터에 맞춰 보정해야 한다 - 합성 세트에서는
+        # gold 0.81~0.95, 중복 0.74, 충돌 0.67, 무관 0.53~0.60 이라 0.65 가 분리점이지만
+        # 이 값은 그 세트에 맞춘 것이지 일반값이 아니다.
+        self.min_relevance = min_relevance
 
     # ------------------------------------------------------------------
 
@@ -134,8 +146,19 @@ class EvidenceIntegrationLayer:
                 latency_ms=(time.perf_counter() - started) * 1000,
             )
 
+        # 0단계 - 관련도 하한 (설정된 경우에만)
+        low_relevance: List[str] = []
+        if self.min_relevance is not None:
+            passing = [c for c in cards if c.relevance >= self.min_relevance]
+            # 전부 잘려나가면 근거 없는 답변이 되므로 최상위 1장은 남긴다.
+            if not passing and cards:
+                passing = [max(cards, key=lambda c: c.relevance)]
+            low_relevance = [c.card_id for c in cards if c not in passing]
+            cards = passing
+
         # 1단계 - 규칙 기반 사전정리
         cards, duplicate_groups, dropped = self._prefilter(cards)
+        dropped.extend(low_relevance)
 
         needs_llm = self.client is not None and self._needs_llm(cards, context)
 

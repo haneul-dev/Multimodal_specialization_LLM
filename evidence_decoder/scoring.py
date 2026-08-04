@@ -13,7 +13,8 @@ datagen.py 가 근거마다 심어둔 역할 라벨(_role)을 기준으로 각 �
         irrelevant_rejection   무관 근거 중 카드를 만들지 않은 비율 (높을수록 좋음)
         source_hallucination   없는 evidence_id 를 참조한 카드 비율 (낮을수록 좋음)
 
-  [2층] duplicate_removal      중복 근거 카드가 제거·묶임된 비율 (높을수록 좋음)
+  [2층] duplicate_removal      중복 근거가 최종 근거에 남지 않은 비율 (결과)
+        duplicate_recognized   중복으로 인지해 묶은 비율 (2층이 표방하는 기능)
         conflict_detection     모순 근거 카드가 충돌로 보고된 비율 (높을수록 좋음)
         reinforcing_preserved  타 모달 보강 카드가 살아남은 비율 (높을수록 좋음)
         final_gold_precision   최종 카드 중 gold 출처 비율 = 근거 희석 억제
@@ -53,6 +54,7 @@ class QualityScore:
     source_hallucination: Optional[float] = None
     # 2층
     duplicate_removal: Optional[float] = None
+    duplicate_recognized: Optional[float] = None
     conflict_detection: Optional[float] = None
     reinforcing_preserved: Optional[float] = None
     final_gold_precision: Optional[float] = None
@@ -132,13 +134,16 @@ def score_rules(output: DecoderOutput, packet: Mapping[str, Any]) -> QualityScor
         return [card for card in all_cards if roles.get(card.source_evidence_id) == role]
 
     duplicate_cards = cards_from(DUPLICATE)
-    # 중복은 "제거되었거나 중복 묶음으로 보고되었으면" 처리된 것으로 본다.
+    # 두 가지를 나눠 센다. 이전에는 하나로 묶어 재다가 "다른 이유로 버려진 것"을
+    # 중복 처리 성공으로 오인했다.
+    #   removal    최종 근거에 남지 않았는가 (결과)
+    #   recognized 중복으로 인지해 묶었는가 (2층이 표방하는 기능)
     score.duplicate_removal = _ratio(
-        sum(
-            1
-            for card in duplicate_cards
-            if card.card_id not in kept_ids or card.card_id in grouped_ids
-        ),
+        sum(1 for card in duplicate_cards if card.card_id not in kept_ids),
+        len(duplicate_cards),
+    )
+    score.duplicate_recognized = _ratio(
+        sum(1 for card in duplicate_cards if card.card_id in grouped_ids),
         len(duplicate_cards),
     )
 
@@ -308,6 +313,7 @@ METRIC_ORDER = [
     ("irrelevant_rejection", "무관거부", True),
     ("source_hallucination", "출처환각", False),
     ("duplicate_removal", "중복제거", True),
+    ("duplicate_recognized", "중복인지", True),
     ("conflict_detection", "충돌탐지", True),
     ("reinforcing_preserved", "보강보존", True),
     ("final_gold_precision", "근거정밀", True),

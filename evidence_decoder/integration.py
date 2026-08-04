@@ -31,15 +31,20 @@ INTEGRATION_SCHEMA: Dict[str, Any] = {
     "properties": {
         "kept_card_ids": {"type": "array", "items": {"type": "string"}},
         "dropped_card_ids": {"type": "array", "items": {"type": "string"}},
-        "duplicate_groups": {
+        # 열린 형태로 "중복을 찾아라" 하면 모델이 그냥 넘어간다. 실측에서
+        # 공랭식 중복쌍(공랭식 vs 냉매 순환 없이 바람만으로)을 전혀 잡지 못했다.
+        # 후보 쌍을 미리 주고 쌍마다 예/아니오를 강제하면 판정률이 올라간다.
+        "pair_verdicts": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "card_ids": {"type": "array", "items": {"type": "string"}},
-                    "representative": {"type": "string"},
+                    "card_a": {"type": "string"},
+                    "card_b": {"type": "string"},
+                    "same_fact": {"type": "boolean"},
+                    "reason": {"type": "string"},
                 },
-                "required": ["card_ids", "representative"],
+                "required": ["card_a", "card_b", "same_fact", "reason"],
                 "additionalProperties": False,
             },
         },
@@ -69,7 +74,7 @@ INTEGRATION_SCHEMA: Dict[str, Any] = {
             },
         },
     },
-    "required": ["kept_card_ids", "dropped_card_ids", "duplicate_groups", "conflicts", "coverage"],
+    "required": ["kept_card_ids", "dropped_card_ids", "pair_verdicts", "conflicts", "coverage"],
     "additionalProperties": False,
 }
 
@@ -79,13 +84,20 @@ INTEGRATION_SYSTEM = """너는 멀티모달 RAG 시스템의 근거 통합 계�
 최종 답변 디코더가 쓸 근거 집합으로 정리한다. 답변은 작성하지 않는다.
 
 할 일
-1. 중복: 같은 사실을 말하는 카드를 묶고 대표 1개만 남긴다.
-   판단 기준은 어휘가 아니라 의미다. 표현이 전혀 겹치지 않아도 같은 사실을
-   말하면 중복이다. 예를 들어 "느린 호흡과 긴 컷을 유지했다" 와 "컷을 자주
-   나누지 않고 인물을 오래 담아냈다" 는 단어가 거의 겹치지 않지만 같은 사실이다.
-   앞 단계의 어휘 기반 규칙은 이런 중복을 잡지 못하므로 여기서 반드시 잡아야 한다.
-   모든 카드 쌍을 하나씩 대조하고, 같은 사실을 말하는 묶음마다 대표 1개만 남겨라.
-   단 모달리티가 다르면 서로를 보강하는 것이므로 묶지 마라.
+1. 중복: 아래에 주어지는 [중복 후보 쌍] 목록의 **모든 쌍**에 대해 same_fact 를
+   판정해 pair_verdicts 에 넣어라. 한 쌍도 빠뜨리지 마라.
+   판단 기준은 어휘가 아니라 의미다. 표현이 전혀 겹치지 않아도, 한쪽이 전문
+   용어를 쓰고 다른 쪽이 그 원리를 풀어 썼어도, 가리키는 사실이 같으면 true 다.
+   예시
+   - "공랭식 열관리를 채택했다" 와 "냉매 순환 없이 바람만으로 열을 빼내는
+     구조였다" -> true. 용어와 설명의 관계일 뿐 같은 사실이다.
+   - "느린 호흡과 긴 컷을 유지했다" 와 "컷을 자주 나누지 않고 인물을 오래
+     담아냈다" -> true.
+   - 한쪽이 세부 설명을 덧붙였다는 이유로 false 로 하지 마라. 핵심 사실이
+     같으면 덧붙은 설명은 중복 판정을 바꾸지 않는다.
+   - 대상이 다르면(초기 모델 vs 개선 모델, 감독 A vs 감독 B) false 다.
+   same_fact=true 인 쌍은 둘 중 하나만 kept_card_ids 에 남기고 나머지는
+   dropped_card_ids 로 보내라. 더 구체적인 쪽을 남긴다.
 2. 충돌: 서로 모순되는 카드를 찾아 무엇이 충돌인지, 어느 쪽을 우선할지 적는다.
    검색점수와 confidence 가 높은 쪽을 우선하되 판단 근거를 resolution 에 남겨라.
 3. 선별: 질문에 답하는 데 불필요한 카드는 dropped_card_ids 로 보낸다.
@@ -112,6 +124,7 @@ class EvidenceIntegrationLayer:
         duplicate_threshold: float = 0.85,
         cross_modal_threshold: float = 0.35,
         min_relevance: Optional[float] = None,
+        max_pairs: int = 20,
     ) -> None:
         self.client = client
         self.max_cards = max_cards
@@ -127,6 +140,8 @@ class EvidenceIntegrationLayer:
         # gold 0.81~0.95, 중복 0.74, 충돌 0.67, 무관 0.53~0.60 이라 0.65 가 분리점이지만
         # 이 값은 그 세트에 맞춘 것이지 일반값이 아니다.
         self.min_relevance = min_relevance
+        # 중복 후보 쌍 상한. 카드가 많으면 쌍이 제곱으로 늘어 프롬프트가 커진다.
+        self.max_pairs = max_pairs
 
     # ------------------------------------------------------------------
 
@@ -334,7 +349,38 @@ class EvidenceIntegrationLayer:
                 f"  상세: {card.detail}"
             )
         lines.append(f"[근거 카드 {len(cards)}개]\n" + "\n".join(card_lines))
+
+        pairs = self._candidate_pairs(cards)
+        if pairs:
+            pair_lines = [
+                f"- {a.card_id} vs {b.card_id}\n"
+                f"    A: {a.claim}\n"
+                f"    B: {b.claim}"
+                for a, b in pairs
+            ]
+            lines.append(
+                f"[중복 후보 쌍 {len(pairs)}개]\n" + "\n".join(pair_lines)
+                + "\n\n위 쌍 전부에 대해 same_fact 를 판정해 pair_verdicts 에 넣어라."
+            )
         return "\n\n".join(lines)
+
+    def _candidate_pairs(self, cards: List[EvidenceCard]):
+        """같은 모달리티 카드 쌍을 중복 후보로 만든다.
+
+        모달리티가 다르면 서로 보강하는 근거이므로 후보에서 뺀다.
+        쌍이 너무 많으면 어휘 유사도 상위만 남긴다. 유사도는 후보를 고르는
+        데만 쓰고 판정에는 쓰지 않는다 - 판정은 의미로 해야 하기 때문이다.
+        """
+        pairs = [
+            (a, b)
+            for i, a in enumerate(cards)
+            for b in cards[i + 1:]
+            if a.modality == b.modality
+        ]
+        if len(pairs) > self.max_pairs:
+            pairs.sort(key=lambda ab: _similarity(ab[0].claim, ab[1].claim), reverse=True)
+            pairs = pairs[: self.max_pairs]
+        return pairs
 
     def _apply_llm_result(
         self,
@@ -346,24 +392,52 @@ class EvidenceIntegrationLayer:
         started: float,
     ) -> IntegratedEvidence:
         by_id = {card.card_id: card for card in cards}
-        kept_ids = [cid for cid in (raw.get("kept_card_ids") or []) if cid in by_id]
 
+        # 쌍 판정을 묶음으로 합친다(연결 성분). 모델이 묶음을 직접 만들게 하면
+        # 누락이 잦아, 쌍 단위 예/아니오를 받아 여기서 결정적으로 구성한다.
+        same_pairs = [
+            (str(v.get("card_a")), str(v.get("card_b")))
+            for v in (raw.get("pair_verdicts") or [])
+            if isinstance(v, Mapping)
+            and v.get("same_fact")
+            and str(v.get("card_a")) in by_id
+            and str(v.get("card_b")) in by_id
+        ]
+        llm_groups = _merge_pairs(same_pairs)
+        duplicate_groups.extend(llm_groups)
+
+        kept_ids = [cid for cid in (raw.get("kept_card_ids") or []) if cid in by_id]
         # LLM 이 전부 버리면 근거 없는 답변이 되므로 규칙 결과로 되돌린다.
         kept = [by_id[cid] for cid in kept_ids] if kept_ids else list(cards)
+
+        # 중복 묶음에서 한쪽만 남긴다. 모델이 kept_card_ids 를 잘못 채워도
+        # 중복이 함께 살아남지 않도록 규칙으로 강제한다.
+        #
+        # 생존자 기준을 처음에는 "더 구체적인(긴) 쪽"으로 두었으나 실패했다.
+        # 중복본이 원본보다 길면 원본을 밀어내, 중복인지 1.00 인데 중복제거는
+        # 0.33 에 그쳤다. 같은 사실이라면 어느 쪽을 남겨도 정보량은 같으므로,
+        # 검색기와 디코더가 더 관련 있다고 판단한 쪽을 남기는 것이 맞다.
+        deduped_out: List[str] = []
+        for group in llm_groups:
+            survivors = [card for card in kept if card.card_id in group]
+            if len(survivors) > 1:
+                best = max(
+                    survivors,
+                    key=lambda card: (card.priority(), card.retrieval_score, card.char_cost()),
+                )
+                for card in survivors:
+                    if card.card_id != best.card_id:
+                        kept.remove(card)
+                        deduped_out.append(card.card_id)
+
         kept = self._ensure_modality_coverage(kept, cards)
         kept.sort(key=lambda card: card.priority(), reverse=True)
         kept, over_budget = self._apply_budget(kept)
 
-        dropped = list(dict.fromkeys(dropped + over_budget +
+        dropped = list(dict.fromkeys(dropped + deduped_out + over_budget +
                        [cid for cid in (raw.get("dropped_card_ids") or []) if cid in by_id]))
         kept_id_set = {card.card_id for card in kept}
         dropped = [cid for cid in dropped if cid not in kept_id_set]
-
-        for group in raw.get("duplicate_groups") or []:
-            if isinstance(group, Mapping):
-                ids = [cid for cid in (group.get("card_ids") or []) if cid in by_id]
-                if len(ids) > 1:
-                    duplicate_groups.append(ids)
 
         conflicts = [
             ConflictNote(
@@ -434,6 +508,33 @@ class EvidenceIntegrationLayer:
     def _missing(self, cards: List[EvidenceCard], context: DecoderTask) -> List[str]:
         coverage = self._rule_coverage(cards, context)
         return [operation for operation, ok in coverage.items() if not ok]
+
+
+def _merge_pairs(pairs: Sequence[tuple]) -> List[List[str]]:
+    """같은 사실로 판정된 쌍들을 연결 성분으로 합친다.
+
+    A=B, B=C 로 판정되면 {A,B,C} 한 묶음이다. 쌍 단위 판정을 묶음으로
+    바꾸는 일은 규칙으로 하는 것이 안전하다 - 모델에게 묶음을 직접 만들게
+    하면 일관성 없는 결과가 나온다.
+    """
+    parent: Dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in pairs:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    groups: Dict[str, List[str]] = {}
+    for node in parent:
+        groups.setdefault(find(node), []).append(node)
+    return [sorted(members) for members in groups.values() if len(members) > 1]
 
 
 _TOKEN_RE = re.compile(r"[0-9a-zA-Z가-힣]+")

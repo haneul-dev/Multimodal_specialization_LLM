@@ -248,6 +248,7 @@ class GeminiVisionClient:
         temperature: float = 0.0,
         timeout: float = 180.0,
         max_retries: int = 2,
+        thinking: Optional[str] = "low",
     ) -> None:
         key = api_key or os.getenv("GOOGLE_API_KEY")
         if not key:
@@ -257,6 +258,14 @@ class GeminiVisionClient:
         self.temperature = temperature
         self.timeout = timeout
         self.max_retries = max_retries
+        # Gemini 3.x 는 내부 추론이 기본으로 켜져 있다. 실측으로 이미지 443,
+        # 영상 435 사고 토큰을 소비했고 이것이 지연에 직접 반영된다.
+        #   이미지 4.99s(기본) -> 4.32s(budget=0) -> 3.97s(level=low)
+        # 다만 끄면 서술 정확도가 떨어진다. 같은 영상을 두고 기본은
+        # "빽빽하게 깔린 넙치 무리", 끔은 "흩어져 있다"로 상반된 판독을 냈다.
+        # 그래서 완전히 끄지 않고 'low' 를 기본값으로 둔다.
+        # None 이면 모델 기본값을 쓴다.
+        self.thinking = thinking
         self.stats = CallStats()
 
     def generate_json(
@@ -285,6 +294,12 @@ class GeminiVisionClient:
         }
         if schema is not None:
             generation_config["response_schema"] = _to_gemini_schema(schema)
+        if self.thinking is not None:
+            generation_config["thinkingConfig"] = (
+                {"thinkingBudget": self.thinking}
+                if isinstance(self.thinking, int)
+                else {"thinkingLevel": self.thinking}
+            )
 
         payload = {
             "systemInstruction": {"parts": [{"text": system_prompt}]},

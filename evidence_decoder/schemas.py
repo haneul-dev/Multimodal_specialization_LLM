@@ -185,6 +185,13 @@ class DecoderTrace:
     cards_after_integration: int = 0
     bypassed_modality_stage: bool = False
     bypassed_integration: bool = False
+    # 실행 중 백엔드가 폴백으로 내려갔는지. 비어 있지 않으면 그 실행의
+    # 지연/품질 수치는 정상 경로의 값이 아니므로 실험에서 제외해야 한다.
+    degraded_backends: List[str] = field(default_factory=list)
+
+    @property
+    def is_valid_sample(self) -> bool:
+        return not self.degraded_backends
 
 
 @dataclass

@@ -76,7 +76,15 @@ SYSTEM_PROMPT = """너는 멀티모달 RAG 시스템의 {modality} 근거 해석
 4. supports 에는 이 카드가 기여하는 required_operations 항목을 적어라. 해당 없으면 빈 배열.
 5. relevance 는 질문 초점 대비 관련도, confidence 는 근거 자체의 명확성이다. 둘 다 0.0~1.0.
 6. 근거에 없는 내용을 추론으로 채우지 마라. 부족하면 is_sufficient=false 로 신고하라.
-7. 모든 문자열은 한국어로 쓴다."""
+7. 모든 문자열은 한국어로 쓴다.{brevity}"""
+
+# 출력 토큰이 지연에 직접 반영된다. 실측(gemini-3.5-flash, 이미지 1건):
+#   기본 421토큰 6.31s -> 간결 291토큰 5.22s (-17%)
+#   solar-pro3 텍스트: 197토큰 1.84s -> 164토큰 1.77s (-4%)
+# 비전 쪽 이득이 크므로 기본값으로 켠다.
+BREVITY_CLAUSE = """
+8. 분량을 압축하라. claim 은 한 문장, detail 은 60자 이내, modality_summary 는
+   40자 이내로 쓴다. 뒤 단계가 다시 요약하므로 여기서 길게 쓸 이유가 없다."""
 
 
 def _build_user_prompt(task: ModalityTask, context: DecoderTask, evidence_block: str) -> str:
@@ -107,6 +115,14 @@ class ModalityEvidenceDecoder(ABC):
 
     modality: Modality
     max_cards_per_evidence: int = 2
+    concise: bool = True
+
+    def _system_prompt(self, modality: Modality) -> str:
+        return SYSTEM_PROMPT.format(
+            modality=modality.value,
+            max_cards=self.max_cards_per_evidence,
+            brevity=BREVITY_CLAUSE if self.concise else "",
+        )
 
     @abstractmethod
     def decode(self, task: ModalityTask, context: DecoderTask) -> ModalityEvidenceResult:
@@ -191,11 +207,13 @@ class TextEvidenceDecoder(ModalityEvidenceDecoder):
         max_cards_per_evidence: int = 2,
         max_chars_per_evidence: int = 2000,
         modality: Modality = Modality.TEXT,
+        concise: bool = True,
     ) -> None:
         self.client = client
         self.max_cards_per_evidence = max_cards_per_evidence
         self.max_chars_per_evidence = max_chars_per_evidence
         self.modality = modality
+        self.concise = concise
 
     def decode(self, task: ModalityTask, context: DecoderTask) -> ModalityEvidenceResult:
         started = time.perf_counter()
@@ -203,9 +221,7 @@ class TextEvidenceDecoder(ModalityEvidenceDecoder):
             return self._empty("검색된 근거가 없음", started)
 
         block = "\n\n".join(self._render(item) for item in task.evidence)
-        system = SYSTEM_PROMPT.format(
-            modality=task.modality.value, max_cards=self.max_cards_per_evidence
-        )
+        system = self._system_prompt(task.modality)
         try:
             raw = self.client.generate_json(
                 system, _build_user_prompt(task, context, block), CARD_SCHEMA
@@ -247,12 +263,14 @@ class VisionEvidenceDecoder(ModalityEvidenceDecoder):
         modality: Modality = Modality.IMAGE,
         max_cards_per_evidence: int = 2,
         max_assets: int = 8,
+        concise: bool = True,
     ) -> None:
         self.client = client
         self.asset_loader = asset_loader
         self.modality = modality
         self.max_cards_per_evidence = max_cards_per_evidence
         self.max_assets = max_assets
+        self.concise = concise
 
     def decode(self, task: ModalityTask, context: DecoderTask) -> ModalityEvidenceResult:
         started = time.perf_counter()
@@ -290,9 +308,7 @@ class VisionEvidenceDecoder(ModalityEvidenceDecoder):
                 line += f"\n  비고: {loaded.degraded_reason}"
             lines.append(line)
 
-        system = SYSTEM_PROMPT.format(
-            modality=task.modality.value, max_cards=self.max_cards_per_evidence
-        )
+        system = self._system_prompt(task.modality)
         user = _build_user_prompt(task, context, "\n\n".join(lines))
         if degraded:
             user += (
@@ -320,14 +336,19 @@ def build_modality_decoders(
     vision_client: VisionStructuredClient,
     asset_loader: AssetLoader,
     modalities: Sequence[Modality] = (Modality.TEXT, Modality.IMAGE, Modality.VIDEO),
+    concise: bool = True,
 ) -> Dict[Modality, ModalityEvidenceDecoder]:
     """모달리티 -> 디코더 매핑. 새 모달리티는 여기 한 줄로 추가된다."""
     decoders: Dict[Modality, ModalityEvidenceDecoder] = {}
     for modality in modalities:
         if modality in (Modality.IMAGE, Modality.VIDEO):
-            decoders[modality] = VisionEvidenceDecoder(vision_client, asset_loader, modality)
+            decoders[modality] = VisionEvidenceDecoder(
+                vision_client, asset_loader, modality, concise=concise
+            )
         else:
-            decoders[modality] = TextEvidenceDecoder(text_client, modality=modality)
+            decoders[modality] = TextEvidenceDecoder(
+                text_client, modality=modality, concise=concise
+            )
     return decoders
 
 

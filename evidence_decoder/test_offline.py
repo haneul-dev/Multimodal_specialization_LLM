@@ -196,7 +196,8 @@ def test_pipeline() -> bool:
             Modality.TEXT: TextEvidenceDecoder(text_client),
             Modality.IMAGE: VisionEvidenceDecoder(vision_client, loader, Modality.IMAGE),
         },
-        integration_layer=EvidenceIntegrationLayer(client=text_client, llm_min_cards=1),
+        # FULL_PACKET 의 required_operations 에 compare 가 있어 LLM 통합이 호출된다.
+        integration_layer=EvidenceIntegrationLayer(client=text_client),
         final_decoder=FinalAnswerDecoder(text_client),
         config=PipelineConfig(enable_modality_bypass=False),
     )

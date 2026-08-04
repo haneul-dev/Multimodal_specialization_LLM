@@ -46,9 +46,13 @@ class ArmResult:
     answer_chars: List[int] = field(default_factory=list)
     citations: List[int] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    degraded: List[str] = field(default_factory=list)
 
     def record(self, output: DecoderOutput) -> None:
         trace = output.trace
+        if trace.degraded_backends:
+            # 폴백으로 내려간 실행은 정상 경로의 수치가 아니다.
+            self.degraded.append("; ".join(trace.degraded_backends))
         self.total_ms.append(trace.total_ms)
         self.modality_ms.append(trace.modality_stage_ms)
         self.integration_ms.append(trace.integration_ms)
@@ -76,6 +80,7 @@ class ArmResult:
             "answer_chars_median": med(self.answer_chars),
             "citations_median": med(self.citations),
             "errors": len(self.errors),
+            "degraded": len(self.degraded),
         }
 
 
@@ -168,6 +173,7 @@ def print_table(results: Dict[str, ArmResult]) -> None:
         ("answer_chars_median", "답변자", 7),
         ("citations_median", "인용", 6),
         ("errors", "오류", 5),
+        ("degraded", "오염", 5),
     ]
     print("\n" + "=" * 100)
     print("".join(title.ljust(width) for _, title, width in headers))
@@ -175,6 +181,13 @@ def print_table(results: Dict[str, ArmResult]) -> None:
     for row in rows:
         print("".join(str(row[key]).ljust(width) for key, _, width in headers))
     print("=" * 100)
+
+    polluted = {k: r for k, r in results.items() if r.degraded}
+    if polluted:
+        print("\n[경고] 아래 구성은 백엔드가 폴백으로 내려간 실행이 섞여 있다.")
+        print("       정상 경로의 수치가 아니므로 실험 결과로 쓰면 안 된다.")
+        for key, result in polluted.items():
+            print(f"  - {key}: {len(result.degraded)}/{len(result.total_ms)}회 오염 | {result.degraded[0][:90]}")
 
     baseline = results.get("raw")
     full = results.get("full")

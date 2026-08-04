@@ -56,6 +56,8 @@ class PipelineConfig:
     integration_char_budget: int = 4000
     # 기타
     max_cards_per_evidence: int = 2
+    # 출력 토큰을 압축해 생성 지연을 줄인다. 실측 비전 -17%.
+    concise: bool = True
 
 
 @dataclass
@@ -88,6 +90,7 @@ class MultiLayerDecoderPipeline:
             result.modality.value: round(result.latency_ms, 2) for result in results
         }
         trace.cards_before_integration = sum(len(result.cards) for result in results)
+        trace.degraded_backends = self._degraded_backends()
 
         # ---- 2층 --------------------------------------------------
         if self.config.enable_integration:
@@ -172,6 +175,22 @@ class MultiLayerDecoderPipeline:
                 error=repr(error),
             )
 
+    def _degraded_backends(self) -> List[str]:
+        """폴백으로 내려간 백엔드를 수집한다.
+
+        실측에서 Gemini 무료 할당량이 실행 도중 소진되어(429) 비전 디코더가
+        조용히 캡션 폴백으로 내려갔고, 그 사실을 모른 채 측정한 지연 비교가
+        통째로 무효가 된 적이 있다. 폴백은 운영에서는 옳지만 실험에서는
+        오염이므로 반드시 표면에 드러나야 한다.
+        """
+        degraded: List[str] = []
+        for modality, decoder in self.modality_decoders.items():
+            client = getattr(decoder, "client", None)
+            if getattr(client, "degraded", False):
+                reason = getattr(client, "failure_reason", "")
+                degraded.append(f"{modality.value}:{reason[:80]}" if reason else modality.value)
+        return degraded
+
     def _should_bypass_modality(self, task: DecoderTask) -> bool:
         if self.config.force_modality_bypass:
             return True
@@ -252,7 +271,9 @@ def build_pipeline(
         vision_client = vision_client or defaults["vision"]
 
     loader = AssetLoader(asset_root=asset_root)
-    decoders = build_modality_decoders(text_client, vision_client, loader, modalities)
+    decoders = build_modality_decoders(
+        text_client, vision_client, loader, modalities, concise=config.concise
+    )
     for decoder in decoders.values():
         decoder.max_cards_per_evidence = config.max_cards_per_evidence
 

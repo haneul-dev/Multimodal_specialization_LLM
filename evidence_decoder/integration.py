@@ -104,15 +104,17 @@ class EvidenceIntegrationLayer:
         client: Optional[StructuredLLMClient] = None,
         max_cards: int = 12,
         char_budget: int = 4000,
-        llm_min_cards: int = 4,
         duplicate_threshold: float = 0.85,
+        cross_modal_threshold: float = 0.35,
     ) -> None:
         self.client = client
         self.max_cards = max_cards
         self.char_budget = char_budget
-        # 카드가 이보다 적고 모달리티가 하나면 LLM 통합을 건너뛴다.
-        self.llm_min_cards = llm_min_cards
+        # 같은 모달리티 내 근사 중복 판정 기준 (규칙으로 바로 제거)
         self.duplicate_threshold = duplicate_threshold
+        # 모달리티를 가로지르는 주장이 이만큼 겹치면 LLM 통합을 부른다.
+        # 낮출수록 LLM 호출이 늘고 중복/충돌을 더 잡는다.
+        self.cross_modal_threshold = cross_modal_threshold
 
     # ------------------------------------------------------------------
 
@@ -135,12 +137,7 @@ class EvidenceIntegrationLayer:
         # 1단계 - 규칙 기반 사전정리
         cards, duplicate_groups, dropped = self._prefilter(cards)
 
-        modality_count = len({card.modality for card in cards})
-        needs_llm = self.client is not None and (
-            modality_count > 1
-            or len(cards) >= self.llm_min_cards
-            or context.complexity_level == Level.HIGH
-        )
+        needs_llm = self.client is not None and self._needs_llm(cards, context)
 
         if not needs_llm:
             kept, over_budget = self._apply_budget(cards)
@@ -183,6 +180,44 @@ class EvidenceIntegrationLayer:
         return self._apply_llm_result(
             raw, cards, duplicate_groups, dropped, context, started
         )
+
+    # ------------------------------------------------------------------
+    # LLM 호출 여부 판단
+    # ------------------------------------------------------------------
+
+    def _needs_llm(self, cards: List[EvidenceCard], context: DecoderTask) -> bool:
+        """LLM 통합이 실제로 할 일이 있을 때만 호출한다.
+
+        이전에는 "모달리티 2개 이상"이면 무조건 호출했다. 그런데 멀티모달
+        RAG 에서 그 조건은 거의 항상 참이라 사실상 최적화가 걸리지 않았다.
+        LLM 이 판단할 거리가 있는지를 직접 본다.
+
+        호출이 필요한 경우
+        1. 선별 압력이 있다 - 카드가 상한을 넘거나 분량 예산을 초과한다.
+        2. 중복/충돌 가능성이 있다 - 모달리티를 가로지르는 유사한 주장이 있다.
+           (같은 모달리티 내 중복은 _prefilter 가 이미 규칙으로 제거했다)
+        3. 검증/비교 작업이 요구된다 - 근거 간 대조가 답변의 핵심이다.
+        4. 복잡도가 높다 - 안전망.
+        """
+        if len(cards) > self.max_cards:
+            return True
+        if sum(card.char_cost() for card in cards) > self.char_budget:
+            return True
+        if context.complexity_level == Level.HIGH:
+            return True
+
+        operations = {op.lower() for op in context.required_operations}
+        if operations & {"verify", "compare", "analyze", "검증", "비교"}:
+            return True
+
+        # 모달리티를 가로지르는 유사 주장 = 중복 통합 또는 충돌 판정 대상
+        for i, left in enumerate(cards):
+            for right in cards[i + 1 :]:
+                if left.modality == right.modality:
+                    continue
+                if _similarity(left.claim, right.claim) >= self.cross_modal_threshold:
+                    return True
+        return False
 
     # ------------------------------------------------------------------
     # 1단계

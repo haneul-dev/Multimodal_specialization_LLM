@@ -113,6 +113,7 @@ def run_bench(
     arms: Sequence[str] = ARMS,
     repeat: int = 1,
     asset_root: Optional[str] = None,
+    group_by_meta: bool = False,
 ) -> Dict[str, ArmResult]:
     clients = build_default_clients()
     print(f"비전 백엔드: {clients['vision_backend']}")
@@ -126,31 +127,37 @@ def run_bench(
         except Exception as error:  # noqa: BLE001
             print(f"  (워밍업 실패, 무시: {error})")
 
-    results: Dict[str, ArmResult] = {arm: ArmResult(arm) for arm in arms}
+    results: Dict[str, ArmResult] = {}
     for arm in arms:
         pipeline = build_arm(arm, clients, asset_root)
         for index, packet in enumerate(packets):
+            meta = packet.get("_meta") or {}
+            label = meta.get("group") if group_by_meta else None
+            key = f"{arm}@{label}" if label else arm
+            result = results.setdefault(key, ArmResult(key))
+            name = meta.get("packet_id", f"패킷{index}")
+
             for _ in range(repeat):
                 try:
                     output = pipeline.run(packet)
-                    results[arm].record(output)
+                    result.record(output)
                     print(
-                        f"  [{arm}] 패킷{index} "
+                        f"  [{arm}] {name:22s} "
                         f"{output.trace.total_ms:7.0f}ms  "
                         f"호출{output.trace.llm_calls}  "
                         f"카드{output.trace.cards_before_integration}->"
                         f"{output.trace.cards_after_integration}"
                     )
-                except (LLMError, Exception) as error:  # noqa: BLE001
-                    results[arm].errors.append(repr(error))
-                    print(f"  [{arm}] 패킷{index} 실패: {error}")
+                except Exception as error:  # noqa: BLE001
+                    result.errors.append(repr(error))
+                    print(f"  [{arm}] {name} 실패: {error}")
     return results
 
 
 def print_table(results: Dict[str, ArmResult]) -> None:
     rows = [result.summary() for result in results.values()]
     headers = [
-        ("arm", "구성", 10),
+        ("arm", "구성", 26),
         ("total_ms_median", "총지연ms", 10),
         ("modality_ms_median", "1층ms", 9),
         ("integration_ms_median", "2층ms", 9),
@@ -194,12 +201,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--asset-root", help="이미지/영상 원본 루트")
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--arms", nargs="*", default=list(ARMS), choices=list(ARMS))
+    parser.add_argument("--group", action="store_true", help="_meta.group 별로 나눠 집계")
     args = parser.parse_args(argv)
 
     packets = load_packets(args.packets)
     print(f"패킷 {len(packets)}개 x 반복 {args.repeat}회 x 구성 {len(args.arms)}종")
     started = time.perf_counter()
-    results = run_bench(packets, args.arms, args.repeat, args.asset_root)
+    results = run_bench(packets, args.arms, args.repeat, args.asset_root, args.group)
     print_table(results)
     print(f"총 소요 {time.perf_counter() - started:.1f}s")
     return 0

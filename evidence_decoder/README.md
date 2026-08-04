@@ -96,9 +96,33 @@ python -m evidence_decoder.test_offline
 python evidence_decoder/examples/run_live.py
 python evidence_decoder/examples/run_live.py --packet rag_output.json --asset-root ./data
 
+# 합성 패킷 생성 (앞단 없이 실험하기 위한 것)
+python -m evidence_decoder.datagen --sweep latency --out packets_latency.json
+python -m evidence_decoder.datagen --sweep dilution --out packets_dilution.json
+python -m evidence_decoder.datagen --sweep integration --out packets_integration.json
+
 # 지연/품질 비교 실험
-python -m evidence_decoder.bench --repeat 3
+python -m evidence_decoder.bench --packets packets_latency.json --arms raw full --group
 ```
+
+### 합성 패킷을 쓰는 이유
+
+앞단 `adaptive_rag` 의 코퍼스는 하드코딩 문장 3건이고 임베딩은 SHA256 해시 기반 난수라
+(`example_usage_V3.py`), 검색 순위에 의미가 없다. 실제 데이터셋 교체 일정은 미정이다.
+
+그리고 통합 계층이 하는 일(중복제거·충돌확인)은 애초에 실제 검색기로 측정할 수 없다.
+검색 결과에는 "이 둘은 중복", "이 둘은 모순"이라는 정답 라벨이 붙지 않기 때문이다.
+`datagen.py` 는 근거마다 역할(`_role`)을 심어 그 라벨을 만든다.
+
+| 역할 | 측정 대상 |
+|---|---|
+| `gold` | 답변 정확도, 인용 정확도 |
+| `irrelevant` | 근거 희석 억제율 |
+| `duplicate` | 중복 제거율 |
+| `contradictory` | 충돌 탐지 재현율 |
+| `reinforcing` | 모달 간 중복 오탐 방지 |
+
+공개 벤치마크(MultimodalQA 등)를 가공할 때도 같은 라벨 체계를 쓴다.
 
 `bench` 비교군:
 
@@ -121,6 +145,7 @@ python -m evidence_decoder.bench --repeat 3
 | `integration.py` | 2층 근거 통합 계층 |
 | `final_decoder.py` | 3층 최종 답변 디코더 |
 | `pipeline.py` | 병렬 실행·바이패스·계측 |
+| `datagen.py` | 합성 패킷 생성기 (근거 역할 라벨 포함) |
 | `bench.py` | 실험 하네스 |
 
 ## adaptive_rag 담당자에게 요청할 사항

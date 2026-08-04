@@ -87,6 +87,14 @@ INTEGRATION_SYSTEM = """너는 멀티모달 RAG 시스템의 근거 통합 계�
    근거가 희석되지 않게 남길 카드는 최대 {max_cards}개로 제한한다.
 4. 커버리지: 각 required_operation 이 남은 카드로 수행 가능한지 판정한다.
 
+주의
+- confidence 가 낮다는 것은 "원본 자료를 직접 확인하지 못했다"는 뜻일 수 있다.
+  틀렸다는 뜻이 아니다. 질문에 직접 답하는 카드라면 confidence 가 낮아도 남겨라.
+- 판단 기준은 confidence 가 아니라 "이 카드가 질문에 답하는가" 다.
+  질문과 무관하지만 확신도가 높은 카드보다, 질문에 직접 답하는 불확실한 카드가 낫다.
+- 각 모달리티에서 최소 1개는 남겨라. 한 모달리티를 통째로 버리면
+  그 모달리티의 검색이 통째로 낭비된다.
+
 kept_card_ids 와 dropped_card_ids 에는 실제로 주어진 card_id 만 쓴다."""
 
 
@@ -284,6 +292,7 @@ class EvidenceIntegrationLayer:
 
         # LLM 이 전부 버리면 근거 없는 답변이 되므로 규칙 결과로 되돌린다.
         kept = [by_id[cid] for cid in kept_ids] if kept_ids else list(cards)
+        kept = self._ensure_modality_coverage(kept, cards)
         kept.sort(key=lambda card: card.priority(), reverse=True)
         kept, over_budget = self._apply_budget(kept)
 
@@ -326,6 +335,33 @@ class EvidenceIntegrationLayer:
             char_used=sum(card.char_cost() for card in kept),
             latency_ms=(time.perf_counter() - started) * 1000,
         )
+
+    @staticmethod
+    def _ensure_modality_coverage(
+        kept: List[EvidenceCard], candidates: List[EvidenceCard]
+    ) -> List[EvidenceCard]:
+        """LLM 이 한 모달리티를 통째로 버리면 최상위 카드 1개를 복원한다.
+
+        비전 백엔드가 폴백으로 동작하면 image/video 카드의 confidence 가 낮게
+        매겨진다. 이는 "원본을 못 봤다"는 뜻이지 "틀렸다"는 뜻이 아닌데,
+        통합 LLM 이 이를 중요도로 오해해 질문에 직접 답하는 카드까지 버리는
+        사례가 실측으로 확인되었다. 모달리티 소실은 규칙으로 막는다.
+        """
+        kept_modalities = {card.modality for card in kept}
+        kept_ids = {card.card_id for card in kept}
+        restored = list(kept)
+
+        for modality in {card.modality for card in candidates}:
+            if modality in kept_modalities:
+                continue
+            pool = [card for card in candidates if card.modality == modality]
+            if not pool:
+                continue
+            best = max(pool, key=lambda card: card.relevance)
+            if best.card_id not in kept_ids:
+                best.metadata["restored_by_coverage_guard"] = True
+                restored.append(best)
+        return restored
 
     # ------------------------------------------------------------------
 
